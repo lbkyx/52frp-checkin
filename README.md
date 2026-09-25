@@ -13,7 +13,8 @@
 | 成功判据 | 复查接口 `signed_today === true` | 签到接口响应 + 页面证据分级 |
 
 默认策略 `auto` = 方法A 先跑，失败（请求异常 / 接口返回错误 / 复查判定没签上）才回退方法B。
-两种方式成功都会走同一套推送（PushPlus / Telegram）。
+两种方式成功都会走同一套**多通道推送**（PushPlus / Telegram / Server酱 / Bark / 钉钉 / 飞书 /
+企业微信 / WxPusher / PushDeer / 云湖 / 自定义 Webhook），配了哪个就发哪个。
 
 ## 工作原理
 
@@ -54,12 +55,36 @@ GET  https://www.52frp.com/api/user/sign/info  复查（唯一可信的成功判
 
 | 名称 | 说明 |
 | --- | --- |
-| `FRP_USERNAME` | 52frp 账号 / 手机号 / 邮箱 |
+| `FRP_USERNAME` | 52frp 账号 / 手机号 / 邮箱（推送正文里会脱敏显示） |
 | `FRP_PASSWORD` | 52frp 密码 |
+| `SENDKEY` | 可选，PushDeer pushkey |
+| `SERVERCHAN_KEY` | 可选，Server酱 SendKey（形如 `SCTxxxxx`） |
 | `PUSHPLUS_TOKEN` | 可选，PushPlus 推送 token |
 | `PUSHPLUS_CHANNEL` | 可选，PushPlus 发送渠道，例如 `wechat` 或 `webhook` |
 | `TG_BOT_TOKEN` | 可选，Telegram Bot token |
 | `TG_CHAT_ID` | 可选，Telegram 接收消息的 chat ID；需与 `TG_BOT_TOKEN` 同时配置 |
+| `DINGTALK_WEBHOOK` | 可选，钉钉机器人 Webhook |
+| `DINGTALK_SECRET` | 可选，钉钉机器人加签密钥（机器人开启加签校验时必填） |
+| `FEISHU_WEBHOOK` | 可选，飞书机器人 Webhook |
+| `FEISHU_SECRET` | 可选，飞书机器人加签密钥（同上） |
+| `WECOM_BOT_WEBHOOK` | 可选，企业微信群机器人 Webhook |
+| `YUNHU_TOKEN` | 可选，云湖机器人 token |
+| `YUNHU_RECV_ID` | 可选，云湖接收人 ID；需与 `YUNHU_TOKEN` 同时配置 |
+| `YUNHU_RECV_TYPE` | 可选，云湖接收类型，`group`（默认）或 `private` |
+| `BARK_KEY` | 可选，Bark 推送 key |
+| `BARK_SERVER` | 可选，Bark 服务地址，默认 `https://api.day.app` |
+| `BARK_GROUP` | 可选，Bark 消息分组 |
+| `WXPUSHER_TOKEN` | 可选，WxPusher appToken |
+| `WXPUSHER_UIDS` | 可选，WxPusher 接收用户 UID，多个用逗号分隔 |
+| `WXPUSHER_TOPIC_IDS` | 可选，WxPusher 主题 ID，多个用逗号分隔 |
+| `WEBHOOK_URL` | 可选，自定义 Webhook 地址 |
+| `WEBHOOK_METHOD` | 可选，`POST`（默认）或 `PUT` |
+| `WEBHOOK_CONTENT_TYPE` | 可选，`json`（默认）或 `form` |
+| `WEBHOOK_HEADERS` | 可选，JSON 对象字符串，追加/覆盖请求头 |
+| `WEBHOOK_BODY` | 可选，JSON 对象模板，支持 `{title}` / `{content}` / `{text}` 占位符 |
+
+只有 `FRP_USERNAME` / `FRP_PASSWORD` 是必填的，其余全是**可选**：
+配了才启用对应渠道，一个都不配就只把结果打进 Actions 日志。
 
 ## 使用方式
 
@@ -74,24 +99,103 @@ GET  https://www.52frp.com/api/user/sign/info  复查（唯一可信的成功判
 - `FRP_USERNAME`
 - `FRP_PASSWORD`
 
-推送渠道**至少要配一个**，否则签到了也不知道结果。两个渠道可以同时配置，
-脚本会同时发送同一条内容；未配置的渠道会自动跳过。
+推送渠道**至少要配一个**，否则签到了也不知道结果。可以同时配置多个，
+脚本会并发发送同一份内容；未配置的渠道自动跳过，单个渠道失败也不影响其它渠道和签到结果。
 
-**渠道一：PushPlus**（可转发到微信 / 企业微信 / 邮件 / Webhook 等）
+**已支持的渠道（配对应变量即启用）**
 
-- `PUSHPLUS_TOKEN` —— 必配，否则该渠道跳过
-- `PUSHPLUS_CHANNEL` —— 可选，发送渠道，例如 `wechat`、`webhook`、`mail`；
-  不填则按 PushPlus 后台的默认渠道发送
+| 渠道 | 需要的 Secrets | 备注 |
+| --- | --- | --- |
+| PushDeer | `SENDKEY` | [pushdeer.com](https://pushdeer.com) 自建或官方服务 |
+| Server酱 | `SERVERCHAN_KEY` | Server酱³ 的 SendKey |
+| Telegram | `TG_BOT_TOKEN` + `TG_CHAT_ID` | 两个都要配，缺一个就跳过 |
+| PushPlus | `PUSHPLUS_TOKEN`（+ 可选 `PUSHPLUS_CHANNEL`） | 可转发到微信服务号 |
+| 钉钉机器人 | `DINGTALK_WEBHOOK`（+ 可选 `DINGTALK_SECRET`） | 开启加签时必填 secret |
+| 飞书机器人 | `FEISHU_WEBHOOK`（+ 可选 `FEISHU_SECRET`） | 同上 |
+| 企业微信机器人 | `WECOM_BOT_WEBHOOK` | 群机器人 Webhook 地址 |
+| 云湖机器人 | `YUNHU_TOKEN` + `YUNHU_RECV_ID` | `YUNHU_RECV_TYPE` 默认 `group` |
+| Bark | `BARK_KEY`（+ 可选 `BARK_SERVER` / `BARK_GROUP`） | iOS 推送 |
+| WxPusher | `WXPUSHER_TOKEN` + `WXPUSHER_UIDS` 或 `WXPUSHER_TOPIC_IDS` | 两个接收人配置都没有时跳过 |
+| 自定义 Webhook | `WEBHOOK_URL` | 增强项见下 |
 
-**渠道二：Telegram**
+**配置示例：Telegram**
 
 - `TG_BOT_TOKEN` —— Telegram Bot token（找 @BotFather 创建机器人获得）
 - `TG_CHAT_ID` —— 接收消息的 chat ID（可通过 @userinfobot 查询自己的 ID）
 
-这两个必须**同时**配置，缺任意一个 Telegram 渠道就跳过。
+**配置示例：企业微信机器人**
 
-> 微信本身不提供个人消息接口，所以「推送到微信」走的是 PushPlus 这类第三方转发服务：
+在群里添加群机器人，复制 Webhook 地址填进 `WECOM_BOT_WEBHOOK` 即可：
+
+```text
+WECOM_BOT_WEBHOOK=https://qyapi.weixin.qq.com/cgi-bin/webhook/send?key=xxxxxxxx
+```
+
+消息以 Markdown 形式发送，正文里的特殊字符会自动转义。
+
+**配置示例：钉钉机器人（加签）**
+
+```text
+DINGTALK_WEBHOOK=https://oapi.dingtalk.com/robot/send?access_token=xxxxxxxx
+DINGTALK_SECRET=SECxxxxxxxx
+```
+
+只填 `DINGTALK_WEBHOOK` 也能发（机器人未开启加签时）；开启加签后必须同时填 secret，
+脚本会自动追加 `timestamp` / `sign` 参数。
+
+**配置示例：自定义 Webhook**
+
+默认以 JSON 方式 POST 以下字段，HTTP 2xx 即视为成功：
+
+```json
+{ "title": "✅ 52frp签到成功", "content": "……", "text": "✅ 52frp签到成功\n\n……" }
+```
+
+想对接有固定请求体格式的服务，用 `WEBHOOK_BODY` 自定义（`{title}` / `{content}` / `{text}`
+三个占位符会被替换，换行和引号会正确转义）：
+
+```text
+WEBHOOK_URL=https://example.com/notify
+WEBHOOK_METHOD=POST
+WEBHOOK_CONTENT_TYPE=json
+WEBHOOK_HEADERS={"Authorization":"Bearer xxxx"}
+WEBHOOK_BODY={"msgtype":"text","text":{"content":"{text}"}}
+```
+
+> 微信本身不提供个人消息接口，所以「推送到微信」走的是 PushPlus / WxPusher 这类第三方转发服务：
 > 在 pushplus.plus 用微信扫码登录拿到 token，再由它把消息转发到你的微信服务号。
+
+### 推送的容错与调优
+
+- 每个渠道单独带超时（`PUSH_TIMEOUT_MS`，默认 15s），只对网络异常 / 429 / 5xx 做指数退避重试
+  （`PUSH_MAX_RETRY`，默认 2 次）；4xx（key 写错之类）立即放弃
+- 单个渠道失败只记日志，不影响其它渠道，也不会让签到运行标红
+- 若希望「已配置的渠道全失败」时把这一步标红，配置 `PUSH_STRICT=1`
+  （workflow 里走仓库 Variables：`PUSH_TIMEOUT_MS` / `PUSH_MAX_RETRY` / `PUSH_STRICT`）
+
+## 推送内容格式
+
+所有渠道共用同一份标题与正文，由 `src/notify/content.js` 统一拼装：
+
+- **标题**：由签到结果首行推导，带状态前缀 —— `✅` 成功 / `🔄` 今日已签到 / `❌` 失败
+- **正文**：执行时间（北京时间）、脱敏后的账号标识、签到结果详情（签到天数 / 本次获得 /
+  剩余流量等），失败时附带失败原因与手动签到提醒
+
+Telegram / PushDeer / Bark / WxPusher 这类只有单文本字段的渠道，按「标题 + 空行 + 正文」发送；
+钉钉 / 飞书 / 企业微信以 Markdown 卡片发送。
+
+```text
+✅ 52frp签到成功
+
+2026-09-25 11:15:00 (UTC+8)
+👤 账号：tes***001
+————————————
+
+签到天数：42 天
+本次获得：256.00MB
+累计获得：12.50GB
+剩余流量：100.99GB
+```
 
 ### 3. 启用 GitHub Actions
 
@@ -163,7 +267,8 @@ node checkin-v2.js
 
 ## 输出示例
 
-脚本最后会输出一行 `CHECKIN_RESULT:`，其后直到输出末尾的所有内容会被 workflow 收集并推送（PushPlus / Telegram）。
+脚本最后会输出一行 `CHECKIN_RESULT:`，其后直到输出末尾的所有内容会被 workflow 收集，
+交给 `push_notification.js` 推送到所有已配置的渠道（标题、时间、账号标识由推送层补齐）。
 
 本次运行完成签到：
 
@@ -252,14 +357,19 @@ CHECKIN_RESULT: 52frp签到成功
 ├── checkin-v2.js             # v2 入口：多方式 + 自动回退（默认）
 ├── src/
 │   ├── browser.js            # 方法B：浏览器签到核心模块
-│   ├── config.js             # 账号配置读取（环境变量 / .env）
+│   ├── config.js             # 账号配置读取（环境变量 / .env）+ 账号脱敏
+│   ├── notify/
+│   │   ├── index.js          # 推送层入口：按环境变量并发启用已配置渠道
+│   │   ├── channels.js       # 各渠道实现 + 渠道注册表 PUSH_CHANNELS
+│   │   ├── content.js        # 统一标题/正文（时间、账号脱敏、结果详情）
+│   │   └── request.js        # 公共请求层：超时、重试、失败日志脱敏
 │   └── checkin/
 │       ├── index.js          # 统一签到层对外入口
 │       ├── runner.js         # 调度器：按序尝试、失败回退、汇总原因
 │       ├── result.js         # 统一返回结构 + 推送文案拼装
 │       ├── api.js            # 方法A：纯 API 直签
 │       └── browser.js        # 方法B 适配器（归一化返回值）
-├── push_notification.js      # PushPlus / Telegram 推送
+├── push_notification.js      # 推送 CLI 入口（workflow 调用的就是它）
 ├── .env.example
 └── README.md
 ```
@@ -299,6 +409,39 @@ async function runMyStrategy(ctx) {
 - 只有 `success` / `already_signed` 会被调度器认定为"这一天已经签到了"并终止流程
 - `error` / `skipped` 会让调度器继续尝试下一个策略
 - 结果里必须能回答"到底签上没签上"，不允许出现"请求发出去了但不知道成没成"就算成功
+
+## 扩展新的推送渠道
+
+渠道注册表是数据驱动的：在 `src/notify/channels.js` 里写一个函数，再往 `PUSH_CHANNELS` 加一行即可，
+超时、重试、日志、失败隔离都由 `src/notify/request.js` 统一处理：
+
+```js
+async function pushMyChannel(title, content) {
+  const key = readEnv('MY_CHANNEL_KEY');
+  if (!key) return false;
+
+  return pushRequest({
+    name: '我的渠道',
+    url: 'https://example.com/send',
+    json: { key, text: formatPushText(title, content) },
+    successCheck: (data) => data.code === 0,   // 什么叫成功
+    failMsgKeys: ['message'],                  // 失败时从响应里取哪个字段做日志
+  });
+}
+
+const PUSH_CHANNELS = [
+  // ...
+  { name: '我的渠道', env: ['MY_CHANNEL_KEY'], send: pushMyChannel },
+];
+```
+
+约定：
+
+- `env` 列出的变量**全部非空**才启用该渠道，否则自动跳过（不会因半个配置报错）
+- 函数只回答"请求体长什么样、什么算成功"，网络异常 / 超时 / 重试交给 `pushRequest`
+- 函数名与渠道名保持一致，便于从日志定位
+- 新增后记得把对应的 Secret 加进 `.github/workflows/daily-checkin.yml` 的
+  `Send notifications` 步骤 —— Actions 只会透传显式列出的 secret
 
 ## 复用方法A 的注意事项
 

@@ -26,7 +26,7 @@
  *   node checkin-v2.js --strategy=browser    # 只验证方法B
  */
 
-const { getCredentials } = require('./src/config');
+const { getCredentials, maskAccount } = require('./src/config');
 const { runCheckin, buildNotice, resolveOrder, STRATEGIES, STATUS } = require('./src/checkin');
 
 function readArg(name) {
@@ -37,13 +37,6 @@ function readArg(name) {
 
 function resolveStrategy() {
   return readArg('strategy') || process.env.CHECKIN_STRATEGY || 'auto';
-}
-
-function maskAccount(username) {
-  if (!username) return '(未配置)';
-  const head = username.substring(0, 3);
-  const tail = username.length > 6 ? username.substring(username.length - 3) : '';
-  return `${head}***${tail}`;
 }
 
 async function main() {

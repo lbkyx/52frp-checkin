@@ -21,7 +21,7 @@
  */
 
 const { pureBrowserCheckIn } = require('./src/browser');
-const { getCredentials } = require('./src/config');
+const { getCredentials, maskAccount } = require('./src/config');
 
 async function main() {
   // 从 shell 环境变量或 .env 文件读取凭证
@@ -40,7 +40,7 @@ async function main() {
     process.exit(1);
   }
 
-  console.log(`账号: ${username.substring(0, 3)}***${username.length > 6 ? username.substring(username.length - 3) : ''}`);
+  console.log(`账号: ${maskAccount(username)}`);
   console.log('');
 
   try {

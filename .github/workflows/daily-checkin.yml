@@ -76,10 +76,38 @@ jobs:
       - name: Send notifications
         if: always()
         env:
+          # 账号标识（推送正文里会脱敏后展示），不配则显示「未配置」
+          FRP_USERNAME: ${{ secrets.FRP_USERNAME }}
+          # 推送渠道：只填用到的即可，未配置的渠道会自动跳过
+          SENDKEY: ${{ secrets.SENDKEY }}
+          SERVERCHAN_KEY: ${{ secrets.SERVERCHAN_KEY }}
           PUSHPLUS_TOKEN: ${{ secrets.PUSHPLUS_TOKEN }}
           PUSHPLUS_CHANNEL: ${{ secrets.PUSHPLUS_CHANNEL }}
           TG_BOT_TOKEN: ${{ secrets.TG_BOT_TOKEN }}
           TG_CHAT_ID: ${{ secrets.TG_CHAT_ID }}
+          DINGTALK_WEBHOOK: ${{ secrets.DINGTALK_WEBHOOK }}
+          DINGTALK_SECRET: ${{ secrets.DINGTALK_SECRET }}
+          FEISHU_WEBHOOK: ${{ secrets.FEISHU_WEBHOOK }}
+          FEISHU_SECRET: ${{ secrets.FEISHU_SECRET }}
+          WECOM_BOT_WEBHOOK: ${{ secrets.WECOM_BOT_WEBHOOK }}
+          YUNHU_TOKEN: ${{ secrets.YUNHU_TOKEN }}
+          YUNHU_RECV_ID: ${{ secrets.YUNHU_RECV_ID }}
+          YUNHU_RECV_TYPE: ${{ secrets.YUNHU_RECV_TYPE }}
+          BARK_KEY: ${{ secrets.BARK_KEY }}
+          BARK_SERVER: ${{ secrets.BARK_SERVER }}
+          BARK_GROUP: ${{ secrets.BARK_GROUP }}
+          WXPUSHER_TOKEN: ${{ secrets.WXPUSHER_TOKEN }}
+          WXPUSHER_UIDS: ${{ secrets.WXPUSHER_UIDS }}
+          WXPUSHER_TOPIC_IDS: ${{ secrets.WXPUSHER_TOPIC_IDS }}
+          WEBHOOK_URL: ${{ secrets.WEBHOOK_URL }}
+          WEBHOOK_METHOD: ${{ secrets.WEBHOOK_METHOD }}
+          WEBHOOK_CONTENT_TYPE: ${{ secrets.WEBHOOK_CONTENT_TYPE }}
+          WEBHOOK_HEADERS: ${{ secrets.WEBHOOK_HEADERS }}
+          WEBHOOK_BODY: ${{ secrets.WEBHOOK_BODY }}
+          # 推送调优（可选，走仓库 Variables；不配则用默认值）
+          PUSH_TIMEOUT_MS: ${{ vars.PUSH_TIMEOUT_MS }}
+          PUSH_MAX_RETRY: ${{ vars.PUSH_MAX_RETRY }}
+          PUSH_STRICT: ${{ vars.PUSH_STRICT }}
           CHECKIN_MESSAGE: ${{ steps.checkin.outputs.checkin_result }}
         run: node push_notification.js "$CHECKIN_MESSAGE"
 
