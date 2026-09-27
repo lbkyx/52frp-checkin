@@ -3,21 +3,10 @@
 52frp 自动签到脚本。用 Playwright 打开真实浏览器模拟人工操作（填账号、过滑块、点签到），
 签完把结果推送到 Telegram / 企业微信 / 钉钉等 11 个渠道。
 
-## 怎么跑
+## 怎么用
 
-| 用法 | 适合谁 | 说明 |
-| --- | --- | --- |
-| **定时自动签到**（推荐） | 想要每天自动签、不用管 | 放在能稳定访问 52frp 的机器上跑 cron：国内/香港 VPS、云函数、或者你自己的电脑（开着机就行） |
-| **手动跑一次** | 想先试试、或临时补签 | Fork 到 GitHub，在 Actions 页面点一下 |
-
-> ⚠️ 不要只依赖 GitHub Actions 做定时签到。GitHub 的 runner 在海外，到 52frp 的源站
-> 经常返回 522/524/525，实测失败率很高。仓库里虽然保留了 workflow，但它只适合手动触发。
-
----
-
-## 一、定时自动签到（推荐）
-
-在一台能正常打开 52frp 的机器上：
+在一台能正常打开 52frp 的机器上跑（国内/香港 VPS、云函数、或者你自己的电脑，开着机就行），
+用 cron 每天定时触发一次：
 
 ```bash
 git clone https://github.com/lbkyx/52frp-checkin.git /opt/52frp-checkin
@@ -38,7 +27,12 @@ cp .env.example .env && chmod 600 .env   # 填账号和推送渠道
 `run-daily.sh` 一次完成「签到 + 推送」，输出实时写入日志，并且带并发锁 ——
 cron 和手动执行撞到一起时会自动跳过，不会开两个浏览器抢同一个账号。
 
-### 环境变量
+想临时补签一次，直接跑 `./run-daily.sh` 即可。
+
+仓库里另有一个 GitHub Actions workflow 可以手动触发，但 GitHub 的 runner 在海外、
+到 52frp 源站经常返回 5xx，成功率不高，别指望它做定时签到。
+
+## 配置
 
 复制 `.env.example` 为 `.env` 后填写。**必填**只有两个：
 
@@ -63,18 +57,6 @@ cron 和手动执行撞到一起时会自动跳过，不会开两个浏览器抢
 | WxPusher | `WXPUSHER_TOKEN` + `WXPUSHER_UIDS`（或 `WXPUSHER_TOPIC_IDS`） |
 | 云湖 | `YUNHU_TOKEN` + `YUNHU_RECV_ID` |
 | 自定义 Webhook | `WEBHOOK_URL` |
-
----
-
-## 二、Fork 到 GitHub 手动跑
-
-1. **Fork** 这个仓库
-2. **配置 Secrets**：`Settings` → `Secrets and variables` → `Actions` → `New repository secret`，
-   添加的变量和上面「环境变量」那张表一样（`FRP_USERNAME` / `FRP_PASSWORD` + 你要用的推送渠道）
-3. **启用 Actions**：进 `Actions` 页面，点 `I understand my workflows, go ahead and enable them`
-4. **运行**：`Actions` → `Daily 52frp Check-in` → `Run workflow` → `Run workflow`
-
----
 
 ## 推送效果
 
@@ -103,9 +85,9 @@ cron 和手动执行撞到一起时会自动跳过，不会开两个浏览器抢
 **失败了会怎样？** 一次运行内最多重试 3 轮（每轮换全新浏览器实例），全失败才推送失败通知。
 
 **报 522 / 524 / 525 是什么问题？** 52frp 的 CDN 回源故障，脚本的重试就是在等它恢复。
-如果你是从海外机器（比如 GitHub Actions）跑的，那基本就是网络问题，换台能直连的机器即可。
+如果是从海外机器跑的，基本就是网络不通，换台能直连站点的机器即可。
 
-**账号安全吗？** 账号密码只存在 Secrets / 本地 `.env`（权限 600）里，不会写进代码；
+**账号安全吗？** 账号密码只存在本地 `.env`（权限 600）里，不会写进代码；
 日志和推送里的账号都是脱敏的，密码全程不打印。
 
 ## License
