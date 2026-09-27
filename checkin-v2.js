@@ -1,23 +1,22 @@
 #!/usr/bin/env node
 
 /**
- * 52frp 自动签到 v2（浏览器自动化）
+ * 52frp 自动签到（Playwright 浏览器自动化）
  *
- * 唯一可用的签到方式是真实浏览器（Playwright Chromium）：站点对非浏览器发起的
- * 请求一律要求滑块验证，纯 API 直签（原「方法A」）已于 2026-09-27 移除。
+ * 用真实浏览器模拟人工操作：打开登录页 → 填账号密码 → 过滑块 → 点签到。
  *
  * 配置：
  *   FRP_USERNAME / FRP_PASSWORD   必填
- *   PUSHPLUS_TOKEN / PUSHPLUS_CHANNEL / TG_BOT_TOKEN / TG_CHAT_ID   推送
+ *   TG_BOT_TOKEN / TG_CHAT_ID 等   推送渠道，见 .env.example
  *
  * 可选配置：
  *   FRP_BROWSER_CHANNEL   浏览器通道，默认 chromium
- *   FRP_BROWSER_HEADLESS  是否无头，默认 true（无头服务器 / cron 环境可直接跑）
+ *   FRP_BROWSER_HEADLESS  是否无头，默认 true（无显示器 / cron 环境可直接跑）
  *   FRP_TIMEOUT_MS        整体超时（毫秒）
  *
  * 用法：
- *   node checkin-v2.js
- *   node checkin-v2.js --strategy=browser    # 等价默认行为，保留参数仅为兼容
+ *   node checkin-v2.js              # 只签到，结果打到 stdout
+ *   ./run-daily.sh                  # 签到 + 推送
  */
 
 const { getCredentials, maskAccount } = require('./src/config');
@@ -30,7 +29,7 @@ function readArg(name) {
 }
 
 function resolveStrategy() {
-  // 方法A 已移除，--strategy / CHECKIN_STRATEGY 仅保留兼容，
+  // --strategy / CHECKIN_STRATEGY 仅为兼容旧配置保留，
   // 无论传什么都归一为浏览器方式（见 src/checkin/runner.js 的 resolveOrder）。
   return readArg('strategy') || process.env.CHECKIN_STRATEGY || 'browser';
 }

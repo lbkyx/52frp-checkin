@@ -67,12 +67,12 @@ test('buildNotice 失败时列出原因，不静默', () => {
 
 // ---- runner.js ----
 
-test('resolveOrder 一律归一为浏览器方式（方法A 已移除）', () => {
+test('resolveOrder 一律归一为浏览器方式', () => {
   assert.deepStrictEqual(resolveOrder('auto'), ['browser']);
   assert.deepStrictEqual(resolveOrder(undefined), ['browser']);
   assert.deepStrictEqual(resolveOrder(''), ['browser']);
   assert.deepStrictEqual(resolveOrder('browser'), ['browser']);
-  // 旧配置里残留的 api 必须被丢弃，而不是让整条链路跑空
+  // 旧配置里残留的值必须被丢弃，而不是让整条链路跑空
   assert.deepStrictEqual(resolveOrder('api'), ['browser']);
   assert.deepStrictEqual(resolveOrder('browser,api'), ['browser']);
   assert.deepStrictEqual(resolveOrder('api,browser'), ['browser']);

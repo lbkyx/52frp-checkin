@@ -1,19 +1,7 @@
 name: Daily 52frp Check-in
 
-# 注意：定时签到已迁到香港服务器的 cron（每天北京时间 11:15）。
-# GitHub-hosted runner 在 Azure 海外，到 52frp 的 ESA 源站长期 5xx，跑不通。
-# 这个 workflow 只保留手动触发，作为备份通道。
 on:
   workflow_dispatch:
-    inputs:
-      strategy:
-        description: 签到方式（方法A 纯 API 已移除，仅保留兼容）
-        required: false
-        default: browser
-        type: choice
-        options:
-          - browser
-          - auto
 
 jobs:
   checkin:
@@ -36,11 +24,9 @@ jobs:
         env:
           FRP_USERNAME: ${{ secrets.FRP_USERNAME }}
           FRP_PASSWORD: ${{ secrets.FRP_PASSWORD }}
-          # 与服务器保持一致：chromium + 无头（默认值就是这两个，写出来是为了明确）
           FRP_BROWSER_CHANNEL: chromium
           FRP_BROWSER_HEADLESS: 'true'
           FRP_DEBUG_DIR: debug-artifacts
-          CHECKIN_STRATEGY: ${{ github.event.inputs.strategy || 'browser' }}
         run: |
           set +e
           output=$(node checkin-v2.js 2>&1)
