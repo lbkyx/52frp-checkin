@@ -17,7 +17,6 @@ const {
   buildNotice: buildNoticeText,
   formatTrafficCompact,
 } = require('./result');
-const { runApiCheckIn } = require('./api');
 const { runBrowserCheckIn } = require('./browser');
 
 const STRATEGY_LABELS = Object.fromEntries(
@@ -42,6 +41,5 @@ module.exports = {
   createResult,
   isOkResult,
   formatTrafficCompact,
-  runApiCheckIn,
   runBrowserCheckIn,
 };

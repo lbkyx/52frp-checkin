@@ -1,0 +1,3 @@
+# Shell 脚本在 Linux / cron 上执行，必须保持 LF；
+# 否则 Windows 上 checkout 成的 CRLF 会让 #!/bin/sh 直接报错。
+*.sh text eol=lf

@@ -1,29 +1,24 @@
 name: Daily 52frp Check-in
 
+# 注意：定时签到已迁到香港服务器的 cron（每天北京时间 11:15）。
+# GitHub-hosted runner 在 Azure 海外，到 52frp 的 ESA 源站长期 5xx，跑不通。
+# 这个 workflow 只保留手动触发，作为备份通道。
 on:
   workflow_dispatch:
     inputs:
       strategy:
-        description: 签到方式顺序
+        description: 签到方式（方法A 纯 API 已移除，仅保留兼容）
         required: false
-        default: auto
+        default: browser
         type: choice
         options:
-          - auto
-          - api
           - browser
-          - browser,api
-  schedule:
-    # 每日签到: UTC 03:15 = 北京时间 11:15
-    - cron: '15 3 * * *'
-    # 每月保活: 每月1号 UTC 00:00 = 北京时间 08:00
-    - cron: '0 0 1 * *'
+          - auto
 
 jobs:
   checkin:
     name: 52frp 签到
     runs-on: ubuntu-latest
-    if: github.event_name != 'schedule' || github.event.schedule != '0 0 1 * *'
     # 签到脚本最多跑 3 轮（见 src/browser.js），每轮之间会等待退避，预留充足余量
     timeout-minutes: 30
     concurrency:
@@ -32,25 +27,20 @@ jobs:
     container:
       image: mcr.microsoft.com/playwright:v1.59.1-jammy
       options: --user root --shm-size=2gb
-    env:
-      DISPLAY: :99
     steps:
       - uses: actions/checkout@v5
       - run: npm ci
-      - name: Start Xvfb
-        run: |
-          Xvfb :99 -screen 0 1920x1080x24 -ac &
-          sleep 2
+      - run: node node_modules/playwright/cli.js install chromium
       - name: Run check-in
         id: checkin
         env:
           FRP_USERNAME: ${{ secrets.FRP_USERNAME }}
           FRP_PASSWORD: ${{ secrets.FRP_PASSWORD }}
-          FRP_BROWSER_HEADLESS: 'false'
+          # 与服务器保持一致：chromium + 无头（默认值就是这两个，写出来是为了明确）
           FRP_BROWSER_CHANNEL: chromium
+          FRP_BROWSER_HEADLESS: 'true'
           FRP_DEBUG_DIR: debug-artifacts
-          # auto = 方法A(纯API) 优先，失败回退方法B(浏览器)；手动运行时可覆盖
-          CHECKIN_STRATEGY: ${{ github.event.inputs.strategy || 'auto' }}
+          CHECKIN_STRATEGY: ${{ github.event.inputs.strategy || 'browser' }}
         run: |
           set +e
           output=$(node checkin-v2.js 2>&1)
@@ -110,24 +100,3 @@ jobs:
           PUSH_STRICT: ${{ vars.PUSH_STRICT }}
           CHECKIN_MESSAGE: ${{ steps.checkin.outputs.checkin_result }}
         run: node push_notification.js "$CHECKIN_MESSAGE"
-
-  keepalive:
-    name: 每月空提交保活
-    if: github.event_name == 'schedule' && github.event.schedule == '0 0 1 * *'
-    runs-on: ubuntu-latest
-    timeout-minutes: 5
-    concurrency:
-      group: 52frp-keepalive
-      cancel-in-progress: false
-    permissions:
-      contents: write
-    steps:
-      - uses: actions/checkout@v5
-        with:
-          fetch-depth: 1
-      - name: 创建空提交并推送
-        run: |
-          git config user.name "github-actions[bot]"
-          git config user.email "github-actions[bot]@users.noreply.github.com"
-          git commit --allow-empty -m "chore: keepalive to prevent workflow suspension"
-          git push

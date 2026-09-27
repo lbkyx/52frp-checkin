@@ -1,39 +1,26 @@
 # 52frp-checkin
 
-基于 GitHub Actions 的 52frp 自动签到脚本。
+[![Daily 52frp Check-in](https://github.com/lbkyx/52frp-checkin/actions/workflows/daily-checkin.yml/badge.svg)](https://github.com/lbkyx/52frp-checkin/actions/workflows/daily-checkin.yml)
 
-内置**两种**签到实现，默认先走快的方法、失败自动回退：
+52frp 自动签到脚本（Playwright 浏览器自动化）。
 
-| | 方法A：API 直签 | 方法B：浏览器自动化 |
-| --- | --- | --- |
-| 代码 | `src/checkin/api.js` | `src/browser.js`（经 `src/checkin/browser.js` 适配） |
-| 是否启动浏览器 | 否，直接 HTTP 调用 | 是，Playwright + Chromium |
-| 典型耗时 | 数秒 | 1～3 分钟 |
-| 能否过滑块 | 不能，被风控就直接失败 | 能，自动拖动滑块 |
-| 成功判据 | 复查接口 `signed_today === true` | 签到接口响应 + 页面证据分级 |
+> **关于曾经的「方法A 纯 API 直签」**：已于 2026-09-27 移除。站点对非浏览器发起的请求
+> 一律要求滑块验证（`GET /api/user/slider-token` 恒定返回「请在签到时重新获取验证」），
+> 实测 GitHub Actions（美国 Azure）与香港服务器结果一致 —— 风控认的是"非浏览器特征"，
+> 与出口地域无关，纯 API 在任何环境都签不上。现在只剩浏览器自动化一种方式。
 
-默认策略 `auto` = 方法A 先跑，失败（请求异常 / 接口返回错误 / 复查判定没签上）才回退方法B。
-两种方式成功都会走同一套**多通道推送**（PushPlus / Telegram / Server酱 / Bark / 钉钉 / 飞书 /
+| | 浏览器自动化（当前唯一方式） |
+| --- | --- |
+| 代码 | `src/browser.js`（经 `src/checkin/browser.js` 适配） |
+| 是否启动浏览器 | 是，Playwright + Chromium |
+| 典型耗时 | 1～3 分钟 |
+| 能否过滑块 | 能，自动拖动滑块 |
+| 成功判据 | 签到接口响应 + 页面证据分级 |
+
+签到成功后走**多通道推送**（PushPlus / Telegram / Server酱 / Bark / 钉钉 / 飞书 /
 企业微信 / WxPusher / PushDeer / 云湖 / 自定义 Webhook），配了哪个就发哪个。
 
 ## 工作原理
-
-### 方法A：API 直签
-
-```text
-GET  https://www.52frp.com/user/              预热，取初始 Cookie（含 CSRF）
-POST https://www.52frp.com/api/user/login      账号密码 → Bearer token
-GET  https://www.52frp.com/api/user/sign/info  今日是否已签到
-GET  https://www.52frp.com/api/user/slider-token  取一次性 slider_token
-POST https://www.52frp.com/api/user/sign       提交签到
-GET  https://www.52frp.com/api/user/sign/info  复查（唯一可信的成功判据）
-```
-
-登录后会下发 `hzfrp_user_csrf` Cookie，后续 POST 必须回传 `X-CSRF-Token`，否则 400。
-**签到接口返回 200 只代表"请求被接受"，不代表真的签上了** —— 所以最后必须复查 `signed_today`，
-复查不到 `true` 就判失败并回退方法B，绝不静默当成功。
-
-### 方法B：浏览器自动化
 
 模拟真实用户操作：
 
@@ -44,10 +31,10 @@ GET  https://www.52frp.com/api/user/sign/info  复查（唯一可信的成功判
 5. 点击"立即签到"按钮 → 检查签到结果
 6. 一次运行内最多 3 轮完整重试（每轮换全新浏览器实例，退避 45s / 75s）
 
-**为什么还需要方法B？**
-- 52frp 会校验请求特征（TLS 指纹 + 请求头组合），Node 的 `fetch` 指纹不是 Chrome，可能被直接拒
-- 登录环节的滑块验证纯 API 过不了
-- 浏览器方案更接近真实用户行为，是方法A 失效时的兜底
+**为什么必须用浏览器？**
+- 52frp 会校验请求特征（TLS 指纹 + 请求头组合），Node 的 `fetch` 指纹不是 Chrome，会被风控拒绝
+- 签到前要取一次性 `slider_token`，纯 HTTP 调用拿不到
+- 浏览器方案更接近真实用户行为，是唯一能走通的方式
 
 ## Secrets 配置
 
@@ -204,17 +191,20 @@ Telegram / PushDeer / Bark / WxPusher 这类只有单文本字段的渠道，按
 ### 4. 运行
 
 - 手动运行：`Actions` → `Daily 52frp Check-in` → `Run workflow`
-- 定时运行：默认每天北京时间 **11:15** 执行
+
+> **定时签到已迁走**：GitHub-hosted runner 位于 Azure 海外，到 52frp 的 ESA 源站长期返回
+> 522/524/525，已证明跑不通。现在每天北京时间 11:15 由香港服务器的 cron 执行
+> （见「在无头服务器 / 宝塔面板上部署」），这里的 workflow 只作为手动备份通道。
 
 ## 本地运行
 
 ```bash
-# 复制环境变量模板
-cp .env.example .env
-# 编辑 .env 填入账号密码
+npm ci
+node node_modules/playwright/cli.js install chromium   # 首次需要下载浏览器
 
-node checkin-v2.js               # v2：API 直签优先，失败回退浏览器（推荐）
-node checkin.js                  # v1：只用浏览器
+cp .env.example .env     # 编辑 .env 填入账号密码
+
+node checkin-v2.js       # 浏览器自动化签到（推荐）
 ```
 
 或者直接：
@@ -223,47 +213,57 @@ node checkin.js                  # v1：只用浏览器
 FRP_USERNAME='your_username' FRP_PASSWORD='your_password' node checkin-v2.js
 ```
 
-### 选择执行方式
-
-`CHECKIN_STRATEGY`（或 CLI 参数 `--strategy=`）：
-
-| 值 | 行为 |
-| --- | --- |
-| `auto`（默认） | 方法A → 失败回退方法B |
-| `api` | 只用方法A，失败就直接报失败（不启动浏览器） |
-| `browser` | 只用方法B，等同 v1 行为 |
-| `browser,api` | 自定义顺序 |
+一次完整的签到 + 推送（与定时任务做的事完全一样）：
 
 ```bash
-node checkin-v2.js --strategy=api       # 只验证方法A 通不通
-node checkin-v2.js --strategy=browser   # 只验证方法B
+./run-daily.sh
 ```
 
-GitHub Actions 手动运行时，workflow 的 `strategy` 下拉框可直接选这些值；
-定时运行固定用 `auto`。
+### 浏览器相关变量
 
-### 验证两条路径都通
+| 变量 | 默认值 | 说明 |
+| --- | --- | --- |
+| `FRP_BROWSER_CHANNEL` | `chromium` | 浏览器通道。填 `msedge` 需要机器装了 Edge，服务器上通常没有 |
+| `FRP_BROWSER_HEADLESS` | `true` | 无头模式。无显示器 / cron 环境必须为 `true` |
+| `FRP_TIMEOUT_MS` | 见 `src/browser.js` | 整体超时（毫秒） |
+| `FRP_DEBUG_DIR` | 不落盘 | 失败时保存截图与 HTML 的目录 |
+| `FRP_BLOCK_THIRD_PARTY` | `0` | 是否屏蔽第三方资源（如统计、字体） |
+
+> `CHECKIN_STRATEGY` / `--strategy=` 仍被接受，但只作兼容：无论传什么都归一为浏览器方式
+> （`api` 会被忽略，不会让整条链路跑空）。
+
+## 在无头服务器 / 宝塔面板上部署
+
+GitHub-hosted runner 位于 Azure 海外，到 52frp 的 ESA 源站长期返回 522/524/525，
+**已经证明跑不通**（站点在国内和香港都正常，只有海外出口不行）。所以推荐把定时任务放到
+国内或香港的机器上，`run-daily.sh` 就是为此准备的：
 
 ```bash
-# 1) 只跑方法A：看是否 success / already_signed，或给出明确的失败原因
-node checkin-v2.js --strategy=api
-
-# 2) 只跑方法B：确认浏览器方案仍然可用
-node checkin-v2.js --strategy=browser
-
-# 3) 跑完整回退链路（把方法A 逼失败，看是否自动切到方法B）：
-#    临时把 FRP_PASSWORD 改错再跑 auto，方法A 会在登录环节失败并回退
-node checkin-v2.js
+git clone https://github.com/lbkyx/52frp-checkin.git /opt/52frp-checkin
+cd /opt/52frp-checkin
+npm ci
+node node_modules/playwright/cli.js install chromium
+cp .env.example .env && chmod 600 .env   # 填入账号与推送渠道
+./run-daily.sh                            # 先手动跑一次验证
 ```
 
-方法A 是否可用，取决于 52frp 当时的风控状态。判断依据看日志：
+Chromium 在精简版 Debian/Ubuntu 上可能缺系统库，用 `ldd` 看缺哪些再补：
 
-```text
-[调度] 「API 直签（方法A）」未成功：登录：站点要求滑块验证，纯 API 无法完成（…）
-[调度] 继续尝试下一个方式...
+```bash
+ldd ~/.cache/ms-playwright/chromium-*/chrome-linux64/chrome | grep "not found"
+# 常见：libnspr4 libnss3 libasound2 libatk1.0-0 libatk-bridge2.0-0 libatspi2.0-0
+#       libgbm1 libxcomposite1 libxdamage1 libxfixes3 libxkbcommon0 libxrandr2
+#       libcups2 libpango-1.0-0 libcairo2
 ```
 
-出现这行说明方法A 被风控拦了、正在回退 —— 这是预期行为，不是 bug。
+定时执行（crontab，注意服务器时区）：
+
+```cron
+15 11 * * * /opt/52frp-checkin/run-daily.sh >> /var/log/52frp-checkin.log 2>&1
+```
+
+宝塔面板：`计划任务` → `添加任务` → 类型 `Shell 脚本` → 脚本内容填
+`/opt/52frp-checkin/run-daily.sh`，执行用户选 `root`。
 
 ## 输出示例
 
@@ -301,7 +301,7 @@ CHECKIN_RESULT: 52frp今日已签到（无需重复签到）
 - `status: success` —— 本次运行完成签到
 - `status: already_signed` —— 本轮开始时就已签到，`details.signKind = 'already'`
 
-v2 的推送里会多一行「执行方式」，说明这次是哪一种方式签上的：
+推送里会有一行「执行方式」，说明这次是怎么签上的：
 
 ```text
 CHECKIN_RESULT: 52frp签到成功
@@ -313,13 +313,11 @@ CHECKIN_RESULT: 52frp签到成功
 累计获得：12.5G
 剩余流量：100.99G
 
-执行方式：浏览器自动化（方法B）
-
-备注：API 直签（方法A）失败后，回退到上述方式完成
+执行方式：浏览器自动化
 ```
 
-若方法B 某一轮遇到站点/CDN 临时故障、靠后面几轮才成功，日志里会有 `[重试] 第 N 轮成功`。
-全部方式都失败时，推送会列出每一种方式的失败原因，并提示手动签到。
+若某一轮遇到站点/CDN 临时故障、靠后面几轮才成功，日志里会有 `[重试] 第 N 轮成功`。
+失败时推送会列出失败原因，并提示手动签到，避免断签。
 
 ## 签到状态的判定原则
 
@@ -353,10 +351,11 @@ CHECKIN_RESULT: 52frp签到成功
 ```text
 .
 ├── .github/workflows/daily-checkin.yml
+├── run-daily.sh              # 定时执行入口：签到 + 推送（cron / 宝塔调用）
 ├── checkin.js                # v1 入口：只用浏览器
-├── checkin-v2.js             # v2 入口：多方式 + 自动回退（默认）
+├── checkin-v2.js             # v2 入口：统一签到层（默认）
 ├── src/
-│   ├── browser.js            # 方法B：浏览器签到核心模块
+│   ├── browser.js            # 浏览器签到核心模块
 │   ├── config.js             # 账号配置读取（环境变量 / .env）+ 账号脱敏
 │   ├── notify/
 │   │   ├── index.js          # 推送层入口：按环境变量并发启用已配置渠道
@@ -367,9 +366,8 @@ CHECKIN_RESULT: 52frp签到成功
 │       ├── index.js          # 统一签到层对外入口
 │       ├── runner.js         # 调度器：按序尝试、失败回退、汇总原因
 │       ├── result.js         # 统一返回结构 + 推送文案拼装
-│       ├── api.js            # 方法A：纯 API 直签
-│       └── browser.js        # 方法B 适配器（归一化返回值）
-├── push_notification.js      # 推送 CLI 入口（workflow 调用的就是它）
+│       └── browser.js        # 浏览器适配器（归一化返回值）
+├── push_notification.js      # 推送 CLI 入口（run-daily.sh 调用的就是它）
 ├── .env.example
 └── README.md
 ```
@@ -443,31 +441,26 @@ const PUSH_CHANNELS = [
 - 新增后记得把对应的 Secret 加进 `.github/workflows/daily-checkin.yml` 的
   `Send notifications` 步骤 —— Actions 只会透传显式列出的 secret
 
-## 复用方法A 的注意事项
+## 注意事项
 
 **依赖**
 
-- 只需要 Node 18+（用到内置 `fetch` 和 `Headers.getSetCookie()`），**不新增任何 npm 依赖**
-- 不需要浏览器，方法A 成功时完全不加载 Playwright（`require('../browser')` 是惰性的）
-- 方法B 仍然需要 `npm ci` + Playwright Chromium
+- Node 18+，npm 依赖只有 `playwright`
+- 首次使用要下载 Chromium：`node node_modules/playwright/cli.js install chromium`
 
 **请求频率限制**
 
-- 52frp 签到每天只有 1 次，重复提交会撞上"签到次数超限"；因此方法A 在提交签到这一步**不做重试**，
-  且签到前先查 `sign/info`，已签到就直接返回、不再提交
-- 一次完整的方法A 会发出 6～7 个请求。每天只跑一次，量级很小；但**不要**为了"提高成功率"
-  反复手动触发，同一天多次触发会消耗站点额度并可能触发风控
+- 52frp 签到每天只有 1 次，重复提交会撞上"签到次数超限"；脚本签到前会先查今日状态，
+  已签到就直接返回、不再点击
+- **不要**为了"提高成功率"反复手动触发，同一天多次触发会消耗站点额度并可能触发风控
 - 撞到 429 /「已达上限」时，日志会明确标注 `rate-limit`，此时当天再试也没意义
 
 **合规风险**
 
-- 这是**本人账号**的自动化签到，账号密码只存在 GitHub Secrets，不要写进代码或日志
-  （日志里账号已做脱敏，密码全程不打印）
+- 这是**本人账号**的自动化签到，账号密码只存在 GitHub Secrets 或服务器上的 `.env`
+  （权限 600），不要写进代码或日志（日志里账号已做脱敏，密码全程不打印）
 - 站点侧有反爬/风控是正常的商业行为，脚本只在每天一次的频率下模拟手工操作，
   不做高频轮询、不抓取数据、不批量注册账号
-- 方法A 通过伪造 Chrome 的请求头（UA / `Sec-Ch-Ua` / `Sec-Fetch-*`）贴近真实浏览器行为，
-  这一点从 Cloudflare Worker 迁移到 GitHub Actions 后依然成立；
-  若站点后续加强校验，方法A 会稳定失败 —— 这正是要保留方法B 兜底的原因
 - 若站点服务条款明确禁止自动化访问，请自行评估后再启用
 
 ## 开发

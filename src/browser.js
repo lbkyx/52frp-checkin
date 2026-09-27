@@ -540,19 +540,15 @@ function resolveHeadless() {
     return process.env.FRP_BROWSER_HEADLESS === 'true';
   }
 
-  return Boolean(process.env.CI || process.env.GITHUB_ACTIONS);
+  // 默认无头：cron / 无显示器的服务器起不了有头浏览器。
+  // 需要肉眼观察时显式设 FRP_BROWSER_HEADLESS=false 并自备 Xvfb。
+  return true;
 }
 
 function resolveChannel() {
-  if (process.env.FRP_BROWSER_CHANNEL) {
-    return process.env.FRP_BROWSER_CHANNEL;
-  }
-
-  if (process.env.CI || process.env.GITHUB_ACTIONS) {
-    return 'chromium';
-  }
-
-  return 'msedge';
+  // 默认 chromium：msedge 只在装了 Edge 的桌面机上存在，
+  // 无头服务器上会直接报 "Chromium distribution 'msedge' is not found"。
+  return process.env.FRP_BROWSER_CHANNEL || 'chromium';
 }
 
 /**

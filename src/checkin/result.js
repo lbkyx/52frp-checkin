@@ -124,7 +124,7 @@ function buildNotice(result, options = {}) {
     lines.push('', `执行方式：${strategyLabels[result.strategy] || result.strategy}`);
   }
 
-  // 走过回退时说明一下，便于判断方法A是不是长期失效了
+  // 前面有失败方式时说明一下（多方式并存时才会出现）
   const failedBefore = attempts.filter((a) => a.status === STATUS.ERROR);
   if (result.strategy && failedBefore.length > 0) {
     const names = failedBefore.map((a) => strategyLabels[a.strategy] || a.strategy).join('、');

@@ -3,6 +3,13 @@
 /**
  * 签到调度器：按配置的顺序依次尝试各个签到方法，第一个"成功/已签到"的结果即终止。
  *
+ * 目前只保留浏览器自动化一种方式。曾经还有「方法A 纯 API 直签」作为首选，
+ * 但它已于 2026-09-27 移除：站点对非浏览器发起的请求一律要求滑块验证
+ * （`GET /api/user/slider-token` 恒定返回「请在签到时重新获取验证」），
+ * 实测 GitHub Actions（美国）与香港服务器都是同样结果 —— 风控认的是
+ * "非浏览器特征"，与出口地域无关，纯 API 在任何环境都签不上。
+ * 保留调度器结构是为了未来若站点放宽策略，可以低成本加回新方式。
+ *
  * 设计要点：
  * 1. 策略之间彼此独立，任一策略失败都不会中断整个流程（失败只是换下一种方式）；
  * 2. 每个策略必须返回统一结构（见 result.js），不允许抛异常穿过调度器；
@@ -11,29 +18,23 @@
  */
 
 const { STATUS, createResult, isOkResult } = require('./result');
-const { runApiCheckIn } = require('./api');
 const { runBrowserCheckIn } = require('./browser');
 
 const STRATEGIES = {
-  api: {
-    id: 'api',
-    label: 'API 直签（方法A）',
-    run: runApiCheckIn,
-  },
   browser: {
     id: 'browser',
-    label: '浏览器自动化（方法B）',
+    label: '浏览器自动化',
     run: runBrowserCheckIn,
   },
 };
 
-const DEFAULT_ORDER = ['api', 'browser'];
+const DEFAULT_ORDER = ['browser'];
 
 /**
  * 解析执行顺序配置。
- *   auto                默认：方法A 优先，失败回退方法B
- *   api / browser       只用一种
- *   browser,api / api,browser  自定义顺序
+ *   auto / 空           默认：浏览器自动化
+ *   browser             显式只用浏览器
+ *   含 api 的旧配置      自动丢弃 api（方法A 已移除），不至于让整条链路跑空
  */
 function resolveOrder(raw) {
   const input = String(raw ?? 'auto').trim().toLowerCase();
@@ -42,7 +43,8 @@ function resolveOrder(raw) {
   const parts = input
     .split(/[,;+\s]+/)
     .map((s) => s.trim())
-    .filter(Boolean);
+    .filter(Boolean)
+    .filter((s) => s !== 'api');
 
   if (parts.length === 0) return [...DEFAULT_ORDER];
 

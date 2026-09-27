@@ -1,29 +1,23 @@
 #!/usr/bin/env node
 
 /**
- * 52frp 自动签到 v2（多方式 + 自动回退）
+ * 52frp 自动签到 v2（浏览器自动化）
  *
- * 与 v1（checkin.js，纯浏览器）的区别：
- *   默认先走「方法A 纯 API 直签」，几秒内完成；
- *   只有 A 失败（请求异常 / 接口返回错误 / 复查判定未签上）才回退到「方法B 浏览器自动化」。
- *   两种方式成功都会按原有渠道推送。
+ * 唯一可用的签到方式是真实浏览器（Playwright Chromium）：站点对非浏览器发起的
+ * 请求一律要求滑块验证，纯 API 直签（原「方法A」）已于 2026-09-27 移除。
  *
- * 配置（沿用 v1，无需改动 GitHub Secrets）：
+ * 配置：
  *   FRP_USERNAME / FRP_PASSWORD   必填
- *   PUSHPLUS_TOKEN / PUSHPLUS_CHANNEL / TG_BOT_TOKEN / TG_CHAT_ID   推送（由 workflow 步骤发送）
+ *   PUSHPLUS_TOKEN / PUSHPLUS_CHANNEL / TG_BOT_TOKEN / TG_CHAT_ID   推送
  *
- * 新增可选配置：
- *   CHECKIN_STRATEGY   执行顺序，默认 auto：
- *                        auto            API 直签 → 浏览器（推荐）
- *                        api             只用 API 直签
- *                        browser         只用浏览器（等同 v1 行为）
- *                        browser,api     自定义顺序
- *   FRP_API_TIMEOUT_MS 方法A 单个请求超时，默认 15000
+ * 可选配置：
+ *   FRP_BROWSER_CHANNEL   浏览器通道，默认 chromium
+ *   FRP_BROWSER_HEADLESS  是否无头，默认 true（无头服务器 / cron 环境可直接跑）
+ *   FRP_TIMEOUT_MS        整体超时（毫秒）
  *
  * 用法：
  *   node checkin-v2.js
- *   node checkin-v2.js --strategy=api        # 只验证方法A
- *   node checkin-v2.js --strategy=browser    # 只验证方法B
+ *   node checkin-v2.js --strategy=browser    # 等价默认行为，保留参数仅为兼容
  */
 
 const { getCredentials, maskAccount } = require('./src/config');
@@ -36,14 +30,16 @@ function readArg(name) {
 }
 
 function resolveStrategy() {
-  return readArg('strategy') || process.env.CHECKIN_STRATEGY || 'auto';
+  // 方法A 已移除，--strategy / CHECKIN_STRATEGY 仅保留兼容，
+  // 无论传什么都归一为浏览器方式（见 src/checkin/runner.js 的 resolveOrder）。
+  return readArg('strategy') || process.env.CHECKIN_STRATEGY || 'browser';
 }
 
 async function main() {
   const { username, password } = getCredentials();
 
   console.log('='.repeat(50));
-  console.log('52frp 自动签到 v2（API 直签优先，失败回退浏览器）');
+  console.log('52frp 自动签到 v2（浏览器自动化）');
   console.log('='.repeat(50));
   console.log(`账号: ${maskAccount(username)}`);
 
