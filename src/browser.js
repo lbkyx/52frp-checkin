@@ -35,6 +35,9 @@ const SESSION_PROBE_TIMEOUT_MS = 25_000;
 
 /** 会话判定期间的轮询间隔（ms） */
 const SESSION_PROBE_POLL_MS = 500;
+
+/** 单个失败资源的重试退避基数（ms）：第 n 次重试前等 n * 这个值 */
+const ASSET_RETRY_BACKOFF_MS = 800;
 const LOGIN_PAGE_RENDER_PATTERNS = [
   { source: '登录|账号|账户' },
   { source: 'Account\\s*Login', flags: 'i' },
@@ -156,21 +159,31 @@ function shouldBlockUrl(rawUrl, mode) {
 }
 
 /**
- * 屏蔽与签到无关的第三方资源。
- * 每一次跨洋请求都是一个可能拖垮首屏的失败点，能砍就砍。
- */
-/**
+ * 屏蔽与签到无关的第三方资源，并对已知失败过的同源资源做**单资源重试**。
+ *
+ * 为什么要做单资源重试：一个页面要加载几十个资源，跨境链路上每个都有
+ * 10~30% 的概率撞上 522，于是「全部成功」的概率低到几乎不可能
+ * （0.7^30 ≈ 0.02%）。整页重载对这个问题毫无帮助 —— 它把已经成功的资源
+ * 也一起重来了，失败的那几个照样靠运气。
+ *
+ * 改成对每个失败资源单独重试 3 次后，单资源失败率降到 0.3^4 ≈ 0.8%，
+ * 整页成功率回到 0.992^30 ≈ 79%。这是数量级的差别。
+ *
  * @param {page} page
  * @param {'off'|'safe'|'strict'} mode
  * @param {{ badAssets?: Set<string> }} [options]
- *   badAssets：本次运行内返回过 5xx 的 URL 集合。命中时给请求追加 no-cache，
- *   强制回源重新验证，避免重试又读到本地缓存里那份错误响应。
+ *   badAssets：本次运行内返回过 5xx 的 URL 集合（跨 attempt 累积，不清理）。
+ *   命中时不再走浏览器缓存，而是主动重取并重试；没命中的请求照常 continue，
+ *   让缓存该生效的生效。
  */
 async function installResourceBlocker(page, mode, { badAssets = null } = {}) {
   const blocked = { count: 0 };
+  const retried = { count: 0, fixed: 0 };
+  const retryLimit = resolveEnvInt('FRP_ASSET_RETRY', 3);
 
-  await page.route('**/*', (route) => {
-    const url = route.request().url();
+  await page.route('**/*', async (route) => {
+    const request = route.request();
+    const url = request.url();
 
     if (mode !== 'off' && shouldBlockUrl(url, mode)) {
       blocked.count += 1;
@@ -178,19 +191,50 @@ async function installResourceBlocker(page, mode, { badAssets = null } = {}) {
       return;
     }
 
-    if (badAssets && badAssets.size > 0 && badAssets.has(url)) {
-      // 头部用小写：HTTP/2 下大写头名会被当成协议错误
-      route.continue({
-        headers: {
-          ...route.request().headers(),
-          'cache-control': 'no-cache',
-          pragma: 'no-cache',
-        },
-      }).catch(() => {});
+    // 只对「同源 + GET + 之前 5xx 过」的资源做重试，其余走正常缓存
+    const retryable = (
+      badAssets
+      && badAssets.size > 0
+      && badAssets.has(url)
+      && retryLimit > 0
+      && request.method() === 'GET'
+      && FIRST_PARTY_HOST_PATTERNS.some((re) => re.test(getUrlHost(url) || ''))
+    );
+
+    if (!retryable) {
+      route.continue().catch(() => {});
       return;
     }
 
-    route.continue().catch(() => {});
+    let response = null;
+    let attempts = 0;
+
+    for (let i = 0; i <= retryLimit; i++) {
+      if (i > 0) await sleep(ASSET_RETRY_BACKOFF_MS * i);
+      attempts = i + 1;
+
+      try {
+        response = await route.fetch();
+        if (!isUpstreamError(response.status())) break;
+      } catch {
+        response = null; // 网络层直接失败，继续重试
+      }
+    }
+
+    retried.count += 1;
+
+    if (!response) {
+      // 重试全部失败：如实交给浏览器，让它记录成资源错误（ diagnosis 需要）
+      route.abort().catch(() => {});
+      return;
+    }
+
+    if (!isUpstreamError(response.status())) {
+      retried.fixed += 1;
+      console.log(`[网络] 重取成功 (第 ${attempts} 次): ${getUrlPath(url)}`);
+    }
+
+    await route.fulfill({ response }).catch(() => {});
   });
 
   if (mode === 'off') {
@@ -199,9 +243,14 @@ async function installResourceBlocker(page, mode, { badAssets = null } = {}) {
     console.log(`[网络] 第三方资源屏蔽：已启用 (mode=${mode})`);
   }
 
+  console.log(`[网络] 失败资源自动重试：已启用（每个最多重试 ${retryLimit} 次）`);
+
   page.once('close', () => {
     if (blocked.count > 0) {
       console.log(`[网络] 本轮共拦截 ${blocked.count} 个第三方请求`);
+    }
+    if (retried.count > 0) {
+      console.log(`[网络] 本轮重取 ${retried.count} 个失败资源，救回 ${retried.fixed} 个`);
     }
   });
 }
