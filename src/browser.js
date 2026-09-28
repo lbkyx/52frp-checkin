@@ -712,6 +712,33 @@ function resolveSignKind(signInfo) {
   return /已经签到|已签到/i.test(String(signInfo || '')) ? 'already' : 'success';
 }
 
+/**
+ * 启动持久化浏览器，必要时清掉陈旧锁再重试。
+ *
+ * Chromium 会在 profile 目录里放一个 SingletonLock，正常退出时会删掉；
+ * 但如果上一次是被 kill、机器重启或超时强杀，这个锁就会残留下来，
+ * 之后**每一次**运行都会以 "Failed to create a ProcessSingleton" 直接失败 ——
+ * 对无人值守的 cron 来说是致命的：一次异常就把定时任务永久钉死。
+ *
+ * 锁本身只是个指向「主机名-pid」的符号链接，对应进程已经不存在时清掉是安全的。
+ */
+async function launchPersistentBrowser(profileDir, options) {
+  try {
+    return await chromium.launchPersistentContext(profileDir, options);
+  } catch (error) {
+    const message = String(error?.message || '');
+    const isStaleLock = /ProcessSingleton|SingletonLock|profile is already in use/i.test(message);
+
+    if (!isStaleLock) throw error;
+
+    await fs.rm(path.join(profileDir, 'SingletonLock'), { force: true }).catch(() => {});
+    await fs.rm(path.join(profileDir, 'SingletonCookie'), { force: true }).catch(() => {});
+    console.log('[浏览器] 检测到上一次异常退出残留的 SingletonLock，已清理并重试');
+
+    return chromium.launchPersistentContext(profileDir, options);
+  }
+}
+
 function resolveHeadless() {
   if (typeof process.env.FRP_BROWSER_HEADLESS === 'string') {
     return process.env.FRP_BROWSER_HEADLESS === 'true';
@@ -1446,7 +1473,7 @@ async function attemptCheckInOnce({
    * cookie 与 HTTP 缓存都落盘，跨轮次、跨运行复用。首次成功之后，
    * 那 5MB 的主 bundle 基本都从本地读，不再依赖动不动就 522 的跨境链路。
    */
-  const context = await chromium.launchPersistentContext(profileDir, {
+  const context = await launchPersistentBrowser(profileDir, {
     headless: resolveHeadless(),
     channel: resolveChannel(),
     args: process.platform === 'linux' ? ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage'] : [],
