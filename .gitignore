@@ -3,3 +3,6 @@ node_modules/
 .DS_Store
 debug-artifacts/
 tmp-debug-*.js
+
+# 浏览器 profile：登录态与 HTTP 缓存，含会话信息，绝不入库
+.browser-profile/

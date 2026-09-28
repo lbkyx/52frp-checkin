@@ -15,8 +15,26 @@ const { chromium } = require('playwright');
 
 const LOGIN_PAGE = 'https://www.52frp.com/user/#/auth/login';
 const SIGN_PAGE = 'https://www.52frp.com/user/#/welfare/sign';
+const DASHBOARD_PAGE = 'https://www.52frp.com/user/#/dashboard/overview';
 const DEFAULT_TIMEOUT_MS = 60_000;
 const SIGN_DATE_TIMEZONE = 'Asia/Shanghai';
+
+/**
+ * 浏览器 profile 目录名（默认放在工作目录下）。
+ *
+ * 用持久化 profile 而不是每次 newContext() 的理由：
+ * 签到页是 5MB 级的 Vue SPA，跨境链路上单是主 bundle 就要 6~10 秒，
+ * 而且经常撞上 522/525。每次运行都从头下载等于每轮重新赌一次网络。
+ * 持久化之后 cookie 与 HTTP 缓存都落在磁盘上 —— 只要成功加载过一次，
+ * 之后再跑基本不再依赖网络，最大的失败面直接消失。
+ */
+const DEFAULT_PROFILE_DIR = '.browser-profile';
+
+/** 会话复用判定：直接打开签到页后，等多久判断「已登录 / 被弹回登录页」 */
+const SESSION_PROBE_TIMEOUT_MS = 25_000;
+
+/** 会话判定期间的轮询间隔（ms） */
+const SESSION_PROBE_POLL_MS = 500;
 const LOGIN_PAGE_RENDER_PATTERNS = [
   { source: '登录|账号|账户' },
   { source: 'Account\\s*Login', flags: 'i' },
@@ -141,25 +159,46 @@ function shouldBlockUrl(rawUrl, mode) {
  * 屏蔽与签到无关的第三方资源。
  * 每一次跨洋请求都是一个可能拖垮首屏的失败点，能砍就砍。
  */
-async function installResourceBlocker(page, mode) {
-  if (mode === 'off') {
-    console.log('[网络] 第三方资源屏蔽：已关闭');
-    return;
-  }
-
+/**
+ * @param {page} page
+ * @param {'off'|'safe'|'strict'} mode
+ * @param {{ badAssets?: Set<string> }} [options]
+ *   badAssets：本次运行内返回过 5xx 的 URL 集合。命中时给请求追加 no-cache，
+ *   强制回源重新验证，避免重试又读到本地缓存里那份错误响应。
+ */
+async function installResourceBlocker(page, mode, { badAssets = null } = {}) {
   const blocked = { count: 0 };
 
   await page.route('**/*', (route) => {
     const url = route.request().url();
-    if (shouldBlockUrl(url, mode)) {
+
+    if (mode !== 'off' && shouldBlockUrl(url, mode)) {
       blocked.count += 1;
       route.abort().catch(() => {});
       return;
     }
+
+    if (badAssets && badAssets.size > 0 && badAssets.has(url)) {
+      // 头部用小写：HTTP/2 下大写头名会被当成协议错误
+      route.continue({
+        headers: {
+          ...route.request().headers(),
+          'cache-control': 'no-cache',
+          pragma: 'no-cache',
+        },
+      }).catch(() => {});
+      return;
+    }
+
     route.continue().catch(() => {});
   });
 
-  console.log(`[网络] 第三方资源屏蔽：已启用 (mode=${mode})`);
+  if (mode === 'off') {
+    console.log('[网络] 第三方资源屏蔽：已关闭');
+  } else {
+    console.log(`[网络] 第三方资源屏蔽：已启用 (mode=${mode})`);
+  }
+
   page.once('close', () => {
     if (blocked.count > 0) {
       console.log(`[网络] 本轮共拦截 ${blocked.count} 个第三方请求`);
@@ -167,14 +206,22 @@ async function installResourceBlocker(page, mode) {
   });
 }
 
-/** 关闭浏览器缓存，避免重试时反复拿到 CDN 缓存的同一个错误响应 */
-async function setBrowserCacheDisabled(context, page) {
+/**
+ * 设置 HTTP 缓存开关（默认启用）。
+ *
+ * 启用后静态资源会随持久化 profile 落到磁盘，下一次运行可以直接命中本地缓存，
+ * 不再依赖那条经常 522 的跨境链路。
+ */
+async function configureHttpCache(context, page) {
+  const cacheEnabled = resolveCacheEnabled();
+
   try {
     const cdp = await context.newCDPSession(page);
-    await cdp.send('Network.setCacheDisabled', { cacheDisabled: true });
+    await cdp.send('Network.setCacheDisabled', { cacheDisabled: !cacheEnabled });
+    console.log(`[网络] HTTP 缓存：${cacheEnabled ? '已启用（随 profile 持久化，跨运行复用）' : '已关闭'}`);
     return true;
   } catch (error) {
-    console.log(`[网络] 无法关闭浏览器缓存（${error.message}），继续`);
+    console.log(`[网络] 无法通过 CDP 设置缓存（${error.message}），使用浏览器默认行为`);
     return false;
   }
 }
@@ -233,6 +280,87 @@ async function waitForLoginPageRendered(page, { timeoutMs, upstreamErrors }) {
   }
 
   return { rendered: false };
+}
+
+/**
+ * 判断当前落在哪个视图：签到页（说明登录态有效）/ 登录页（需要账号密码）/ 未知。
+ *
+ * 站点是 hash 路由 SPA：`/user/#/welfare/sign` 和 `/user/#/auth/login`
+ * 请求的是同一份 HTML，Vue 按 hash 决定渲染什么。所以直接打开签到页时，
+ * 登录态有效就直接渲染签到页，无效会被前端路由守卫弹回登录页 —— 这个差别
+ * 就是"cookie 还能不能用"的答案，不需要额外发请求去探测。
+ *
+ * @returns {Promise<{view: 'sign'|'login'|'unknown', abortedByUpstream?: boolean}>}
+ */
+async function waitForAppView(page, { timeoutMs = SESSION_PROBE_TIMEOUT_MS, upstreamErrors = null } = {}) {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    if (upstreamErrors && upstreamErrors.length > 0) {
+      return { view: 'unknown', abortedByUpstream: true };
+    }
+
+    try {
+      const state = await page.evaluate(() => {
+        const text = (document.body?.innerText || '').replace(/\s+/g, ' ').trim();
+        return {
+          url: window.location.href,
+          textLength: text.length,
+          // 「立即签到」按钮：未签到时才在
+          hasSignButton: [...document.querySelectorAll('button')].some((b) =>
+            /立即\s*(?:签到|Check-in)/i.test(String(b.textContent || '').trim())
+          ),
+          // 「上次签到：2026-09-27」这类字段：签到页骨架的一部分，已签到时也在
+          hasLastSignField: /上次(?:签到|Check-in)\s*[:：]?\s*\d/i.test(text),
+          hasPasswordInput: document.querySelectorAll('input[type="password"]').length > 0,
+        };
+      });
+
+      // 被弹回登录页，或登录表单已经渲染出来 —— 都说明登录态没了
+      if (state.url.includes('/auth/login') || state.hasPasswordInput) {
+        return { view: 'login' };
+      }
+
+      // 签到页的硬特征
+      if (state.hasSignButton || state.hasLastSignField) {
+        return { view: 'sign' };
+      }
+
+      // 停在签到路由上且页面确实渲染出了内容（不是骨架屏那点字数）→ 判为已登录。
+      // 阈值取 200：骨架屏/导航栏撑不到这个长度，真正的内容页才有。
+      if (state.url.includes('/welfare/sign') && state.textLength > 200) {
+        return { view: 'sign', viaTextLength: true };
+      }
+    } catch {
+      // 页面正在导航，evaluate 会抛错，下一轮轮询再来
+    }
+
+    await sleep(SESSION_PROBE_POLL_MS);
+  }
+
+  return { view: 'unknown' };
+}
+
+/** 等登录表单真正可填（密码输入框出现），避免刚跳转就开始 fill */
+async function waitForLoginFormReady(page, timeoutMs = 15_000) {
+  const deadline = Date.now() + timeoutMs;
+
+  while (Date.now() < deadline) {
+    try {
+      const inputs = await page.evaluate(() => ({
+        password: document.querySelectorAll('input[type="password"]').length,
+        others: document.querySelectorAll('input:not([type="password"])').length,
+      }));
+
+      if (inputs.password > 0 && inputs.others > 0) return true;
+    } catch {
+      // 导航中，下一轮再来
+    }
+
+    await sleep(SESSION_PROBE_POLL_MS);
+  }
+
+  return false;
 }
 
 function getTodaySignDate() {
@@ -549,6 +677,40 @@ function resolveChannel() {
   // 默认 chromium：msedge 只在装了 Edge 的桌面机上存在，
   // 无头服务器上会直接报 "Chromium distribution 'msedge' is not found"。
   return process.env.FRP_BROWSER_CHANNEL || 'chromium';
+}
+
+/**
+ * 持久化 profile 目录。
+ *
+ * 用 launchPersistentContext 让 cookie / localStorage / HTTP 缓存跨轮次、
+ * 跨运行保留。目录不存在时会自动创建。
+ *
+ * 注意：同一个 profile 目录不能被两个 Chromium 实例同时打开（会有 SingletonLock）。
+ * 定时任务侧已经用 flock 做了互斥，这里不再额外加锁。
+ */
+function resolveProfileDir() {
+  const raw = (process.env.FRP_PROFILE_DIR || '').trim();
+  if (raw) return path.resolve(raw);
+
+  return path.resolve(process.cwd(), DEFAULT_PROFILE_DIR);
+}
+
+/**
+ * 是否启用 HTTP 缓存。
+ *
+ * 早期版本是**主动禁用**缓存的，理由是「别反复拿到 CDN 缓存的错误响应」——
+ * 但那个理由站不住：禁缓存只影响浏览器本地缓存，CDN 边缘缓存不受我们控制；
+ * 副作用却是每次运行都要重新下载那 5MB bundle，得不偿失。
+ *
+ * 现在默认启用。5xx 不会被 Chromium 启发式缓存（RFC 7234 的可启发缓存状态码
+ * 不含 5xx），另外 installResourceBlocker 会对本次运行内返回过 5xx 的 URL
+ * 追加 no-cache 请求头，双保险。真遇到缓存导致的怪问题时用 FRP_CACHE_ENABLED=0 退回。
+ */
+function resolveCacheEnabled() {
+  const raw = (process.env.FRP_CACHE_ENABLED || '').trim().toLowerCase();
+  if (raw === '0' || raw === 'false' || raw === 'off' || raw === 'no') return false;
+
+  return true;
 }
 
 /**
@@ -1226,15 +1388,19 @@ async function attemptCheckInOnce({
 
   const blockMode = resolveBlockThirdPartyMode();
   const debugLabel = (label) => `round${round}-${label}`;
+  const profileDir = resolveProfileDir();
 
-  const browser = await chromium.launch({
+  await fs.mkdir(profileDir, { recursive: true }).catch(() => {});
+
+  /**
+   * 持久化 profile（而非每次 newContext）：
+   * cookie 与 HTTP 缓存都落盘，跨轮次、跨运行复用。首次成功之后，
+   * 那 5MB 的主 bundle 基本都从本地读，不再依赖动不动就 522 的跨境链路。
+   */
+  const context = await chromium.launchPersistentContext(profileDir, {
     headless: resolveHeadless(),
     channel: resolveChannel(),
     args: process.platform === 'linux' ? ['--no-sandbox', '--disable-gpu', '--disable-dev-shm-usage'] : [],
-    ...launchOptions,
-  });
-
-  const context = await browser.newContext({
     viewport: { width: 1280, height: 800 },
     userAgent: 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     extraHTTPHeaders: {
@@ -1242,13 +1408,20 @@ async function attemptCheckInOnce({
       'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
     },
     ignoreHTTPSErrors: true,
+    ...launchOptions,
   });
 
-  const page = await context.newPage();
+  console.log(`[浏览器] 持久化 profile: ${profileDir}`);
+
+  // persistent context 启动时会自带一个 about:blank 页，优先复用它
+  const page = context.pages()[0] ?? await context.newPage();
   page.setDefaultTimeout(timeoutMs);
 
+  /** 本次运行内返回过 5xx 的 URL：重试时强制回源，不读本地缓存里的错误响应 */
+  const badAssets = new Set();
+
   // 砍掉与签到无关的第三方请求，缩小跨境链路上的失败面
-  await installResourceBlocker(page, blockMode);
+  await installResourceBlocker(page, blockMode, { badAssets });
 
   // 收集 JS 控制台错误，用于诊断 Vue SPA 渲染失败
   const jsErrors = [];
@@ -1264,19 +1437,25 @@ async function attemptCheckInOnce({
   const steps = [];
   let loginSuccess = false;
   let sliderHandled = false;
+  let sessionReused = false;
   let dashboardUrl = null;
   let dashboardStats = null;
   let beforeStats = null;
 
   /**
-   * 加载登录页并等待 Vue SPA 完成渲染。
+   * 加载 SPA 并判断落在哪个视图（签到页 = 登录态有效 / 登录页 = 需要账号密码）。
+   *
+   * 直接打开签到页而不是登录页：hash 路由下两个地址取的是同一份 HTML 和同一份
+   * 主 bundle，所以省不掉那次下载；但打开签到页时，登录态有效就直接进签到，
+   * 无效才被弹回登录 —— 顺带把「cookie 还能不能用」也测了，不额外发请求。
    *
    * 相比旧版的三处改动：
-   * 1. 监听响应状态码，命中回源错误（522/524/525 等）立即放弃本次等待，不再傻等超时
-   * 2. 每次重试前清空 cookie、并关闭浏览器缓存，避免反复拿到 CDN 缓存的同一个错误响应
-   * 3. 渲染判据带兜底（见 waitForLoginPageRendered）
+   * 1. 监听响应状态码，命中回源错误（522/524/525 等）立即放弃本次等待，不再傻等超时；
+   *    同时把这些 URL 记进 badAssets，重试时强制回源
+   * 2. 不再清空 cookie —— cookie 现在是要复用的资产，只有确认要走账号密码登录时才清
+   * 3. 视图判据见 waitForAppView
    */
-  async function loadLoginPageWithRetry(maxRetries = LOGIN_PAGE_MAX_ATTEMPTS) {
+  async function loadAppWithRetry(maxRetries = LOGIN_PAGE_MAX_ATTEMPTS) {
     /**
      * 两份数组，职责不同：
      * - upstreamErrorsAll：跨 attempt 累积，用于最终的报错详情
@@ -1293,12 +1472,14 @@ async function attemptCheckInOnce({
         const entry = `${response.status()} ${getUrlPath(response.url())}`;
         upstreamErrors.push(entry);
         if (!upstreamErrorsAll.includes(entry)) upstreamErrorsAll.push(entry);
+        // 记进坏名单：本次运行内再请求这个 URL 时强制回源，别读本地缓存里那份错误响应
+        badAssets.add(response.url());
       }
     };
     page.on('response', onResponse);
 
     try {
-      await setBrowserCacheDisabled(context, page);
+      await configureHttpCache(context, page);
 
       let sawUpstreamError = false;
 
@@ -1308,17 +1489,20 @@ async function attemptCheckInOnce({
         if (attempt > 1) {
           const backoffMs = LOGIN_PAGE_BACKOFF_MS[attempt - 1]
             ?? LOGIN_PAGE_BACKOFF_MS[LOGIN_PAGE_BACKOFF_MS.length - 1];
-          console.log(`[页面] 第 ${attempt} 次重试加载登录页（等待 ${Math.round(backoffMs / 1000)}s）...`);
+          console.log(`[页面] 第 ${attempt} 次重试加载（等待 ${Math.round(backoffMs / 1000)}s）...`);
           await sleep(backoffMs);
-          // 重置环境：清掉上一轮的 cookie，配合上面的关闭缓存，确保重新发起真实请求
-          await context.clearCookies().catch(() => {});
+          // 这里不清 cookie：cookie 是要复用的资产。
+          // 只有「确认要走账号密码登录」时才会清（见主流程），避免误伤有效登录态。
         }
 
         // 第一步：加载页面 HTML
+        // 直接进签到页 —— hash 路由下它和登录页取的是同一份 HTML 与同一份主 bundle，
+        // 省不掉下载；但登录态有效就直接停在签到页，无效才被弹回登录页，顺带把
+        // 「cookie 还能不能用」也测了，不用额外发请求。
         let gotoOk = false;
         for (let gt = 1; gt <= LOGIN_GOTO_ATTEMPTS; gt++) {
           try {
-            await page.goto(LOGIN_PAGE, {
+            await page.goto(SIGN_PAGE, {
               waitUntil: 'domcontentloaded',
               timeout: LOGIN_GOTO_TIMEOUT_MS,
             });
@@ -1332,7 +1516,7 @@ async function attemptCheckInOnce({
 
         if (!gotoOk) {
           if (attempt < maxRetries) continue;
-          const err = new Error('登录页加载失败：多次 goto 均失败（站点/CDN 不可达）');
+          const err = new Error('签到页加载失败：多次 goto 均失败（站点/CDN 不可达）');
           err.kind = 'upstream';
           throw err;
         }
@@ -1342,24 +1526,35 @@ async function attemptCheckInOnce({
           .waitForLoadState('networkidle', { timeout: LOGIN_NETWORKIDLE_TIMEOUT_MS })
           .catch(() => {});
 
-        // 第三步：等待 Vue 渲染（命中回源错误会提前返回）
-        const renderResult = await waitForLoginPageRendered(page, {
+        // 第三步：判断落在哪个视图（命中回源错误会提前返回 unknown）
+        const probe = await waitForAppView(page, {
           timeoutMs: LOGIN_RENDER_TIMEOUT_MS,
           upstreamErrors,
         });
 
-        if (renderResult.rendered) {
-          console.log(`[页面] 登录页渲染成功 (attempt ${attempt}/${maxRetries})`);
+        if (probe.view === 'sign') {
+          console.log(`[页面] 已渲染签到页 → 登录态有效 (attempt ${attempt}/${maxRetries})`);
           await sleep(1000);
-          return;
+          return { view: 'sign' };
         }
 
-        // 未渲染 —— 记录诊断信息并重试
+        if (probe.view === 'login') {
+          // 刚跳转过来时表单可能还没渲染完，等它可填再交回主流程
+          const formReady = await waitForLoginFormReady(page, 15_000);
+          if (formReady) {
+            console.log(`[页面] 已跳转登录页 → 需要账号密码 (attempt ${attempt}/${maxRetries})`);
+            await sleep(1000);
+            return { view: 'login' };
+          }
+          console.log(`[页面] 已跳转登录页但表单尚未就绪 (attempt ${attempt}/${maxRetries})`);
+        }
+
+        // 未判定 —— 记录诊断信息并重试
         const hitUpstream = upstreamErrors.length > 0;
         if (hitUpstream) sawUpstreamError = true;
 
         const bodyLen = (await page.locator('body').innerText().catch(() => '')).length;
-        console.log(`[页面] 登录页未渲染 (body 文本长度=${bodyLen}, attempt ${attempt}/${maxRetries})`);
+        console.log(`[页面] 未能判定视图 (body 文本长度=${bodyLen}, attempt ${attempt}/${maxRetries})`);
 
         if (hitUpstream) {
           console.log(
@@ -1372,161 +1567,177 @@ async function attemptCheckInOnce({
 
         if (attempt < maxRetries) continue;
 
-        await saveDebugArtifacts(page, debugLabel(`login-not-rendered-attempt${attempt}`));
+        await saveDebugArtifacts(page, debugLabel(`view-unknown-attempt${attempt}`));
 
         if (sawUpstreamError) {
           const err = new Error(
-            `站点/CDN 上游故障：登录页资源返回 5xx（${[...new Set(upstreamErrorsAll)].slice(0, 3).join('; ') || '未知'}），稍后重试通常可自愈`
+            `站点/CDN 上游故障：页面资源返回 5xx（${[...new Set(upstreamErrorsAll)].slice(0, 3).join('; ') || '未知'}），稍后重试通常可自愈`
           );
           err.kind = 'upstream';
           throw err;
         }
 
         const err = new Error(
-          `页面结构可能已变化：登录页未渲染且未检测到资源错误（JS 错误: ${[...new Set(jsErrors)].slice(0, 3).join('; ') || '无'}）`
+          `页面结构可能已变化：既没渲染出签到页也没渲染出登录页，且未检测到资源错误（JS 错误: ${[...new Set(jsErrors)].slice(0, 3).join('; ') || '无'}）`
         );
         err.kind = 'structure';
         throw err;
       }
+
+      // 所有 attempt 都没能判定（极端情况）：保守当作需要登录
+      return { view: 'login' };
     } finally {
       page.off('response', onResponse);
     }
   }
 
   try {
-    // 步骤 1: 打开登录页（含 Vue 渲染检测和自动重试）
-    console.log('[1/5] 打开登录页...');
-    steps.push('open_login');
-    await loadLoginPageWithRetry();
+    // 步骤 1: 打开应用（直接进签到页，顺带判定登录态是否还有效）
+    console.log('[1/5] 打开应用并检测登录态...');
+    steps.push('open_app');
+    const { view } = await loadAppWithRetry();
 
-    // 步骤 2: 输入账号密码
-    console.log('[2/5] 输入账号密码...');
-    steps.push('fill_credentials');
+    if (view === 'sign') {
+      // 会话复用：cookie 还有效，直接进签到环节，省掉填表与滑块
+      sessionReused = true;
+      loginSuccess = true;
+      dashboardUrl = DASHBOARD_PAGE;
+      console.log('[2/5] 复用上次登录态（cookie 有效），跳过账号密码与滑块');
+      steps.push('session_reused');
+      dashboardStats = await loadDashboardStats(page, dashboardUrl);
+    } else {
+      // 登录态失效：清掉残留 cookie，用账号密码重新登录（新 cookie 会随 profile 落盘）
+      console.log('[2/5] 登录态失效，改用账号密码登录...');
+      steps.push('fill_credentials');
+      await context.clearCookies().catch(() => {});
 
-    // 多种方式查找输入框（更稳健）
-    const usernameStrategies = [
-      page.getByPlaceholder(/账户|手机号|邮箱|用户名|账号/),
-      page.locator('input[type="text"]').first(),
-      page.locator('input:not([type="password"])').first(),
-      page.locator('input').first(),
-    ];
-    const passwordStrategies = [
-      page.getByPlaceholder(/密码/),
-      page.locator('input[type="password"]').first(),
-      page.locator('input').filter({ has: page.locator('[class*="password"]') }).first(),
-    ];
 
-    let usernameInput = null;
-    let passwordInput = null;
 
-    for (const strategy of usernameStrategies) {
-      try {
-        if (await strategy.count() > 0) {
-          usernameInput = strategy;
-          break;
-        }
-      } catch {}
-    }
-    for (const strategy of passwordStrategies) {
-      try {
-        if (await strategy.count() > 0) {
-          passwordInput = strategy;
-          break;
-        }
-      } catch {}
-    }
+      // 多种方式查找输入框（更稳健）
+      const usernameStrategies = [
+        page.getByPlaceholder(/账户|手机号|邮箱|用户名|账号/),
+        page.locator('input[type="text"]').first(),
+        page.locator('input:not([type="password"])').first(),
+        page.locator('input').first(),
+      ];
+      const passwordStrategies = [
+        page.getByPlaceholder(/密码/),
+        page.locator('input[type="password"]').first(),
+        page.locator('input').filter({ has: page.locator('[class*="password"]') }).first(),
+      ];
 
-    if (!usernameInput || !passwordInput) {
-      await saveDebugArtifacts(page, debugLabel('login-inputs-not-found'));
-      throw new Error('未找到登录输入框，页面可能未正确加载');
-    }
+      let usernameInput = null;
+      let passwordInput = null;
 
-    await usernameInput.fill(username);
-    await passwordInput.fill(password);
-    console.log(`[输入] 账号已填入，密码已填入`);
-
-    // 步骤 3: 点击登录并处理滑块
-    console.log('[3/5] 点击登录...');
-    steps.push('click_login');
-
-    const loginClickResult = await clickLoginButton(page);
-    if (!loginClickResult.clicked) {
-      await saveDebugArtifacts(page, 'login-button-not-found');
-      throw new Error('未找到登录按钮');
-    }
-
-    // 等待一下让滑块可能出现
-    await page.waitForTimeout(1500);
-
-    // 检测并处理滑块
-    const sliderResult = await handleSliderVerification(page, 30_000);
-    sliderHandled = sliderResult.handled;
-
-    if (sliderResult.handled && !sliderResult.success) {
-      // 滑块拖拽后仍未通过，可能需要重试
-      console.log('[滑块] 第一次拖拽未通过，尝试第二次...');
-
-      // 有些滑块需要等待重置
-      await page.waitForTimeout(1000);
-
-      const retryResult = await handleSliderVerification(page, 20_000);
-      if (retryResult.handled && !retryResult.success) {
-        console.log('[滑块] 重试仍未通过，可能需要手动介入');
+      for (const strategy of usernameStrategies) {
+        try {
+          if (await strategy.count() > 0) {
+            usernameInput = strategy;
+            break;
+          }
+        } catch {}
       }
-    }
-
-    // 滑块验证通过后，再次点击登录按钮完成登录
-    if (sliderResult.handled && sliderResult.success) {
-      console.log('[登录] 滑块验证通过，再次点击登录...');
-      const retryLoginClickResult = await clickLoginButton(page);
-      if (!retryLoginClickResult.clicked) {
-        await saveDebugArtifacts(page, debugLabel('login-button-not-found-after-slider'));
-        throw new Error('滑块验证通过后未找到登录按钮');
-      }
-      await page.waitForTimeout(2000);
-    }
-
-    // 等待登录成功
-    loginSuccess = await waitForLoginSuccess(page, 25_000);
-
-    // 登录页是 Vue SPA，滑块通过后的二次点击在 CI 上偶发不跳转。
-    // 这跟账号密码无关，页内重新提交一次通常就过去了；
-    // 直接判成凭证错误会连带取消后面的重试轮次，代价太大。
-    for (let attempt = 1; attempt <= 2 && !loginSuccess; attempt++) {
-      if (!page.url().includes('/auth/login')) break;
-
-      console.log(`[登录] 仍在登录页，重新提交登录 (${attempt}/2)...`);
-      await page.waitForTimeout(2000);
-      await dismissBlockingOverlays(page);
-
-      const reClick = await clickLoginButton(page);
-      if (!reClick.clicked) {
-        console.log('[登录] 重试时未找到登录按钮');
-        break;
+      for (const strategy of passwordStrategies) {
+        try {
+          if (await strategy.count() > 0) {
+            passwordInput = strategy;
+            break;
+          }
+        } catch {}
       }
 
+      if (!usernameInput || !passwordInput) {
+        await saveDebugArtifacts(page, debugLabel('login-inputs-not-found'));
+        throw new Error('未找到登录输入框，页面可能未正确加载');
+      }
+
+      await usernameInput.fill(username);
+      await passwordInput.fill(password);
+      console.log(`[输入] 账号已填入，密码已填入`);
+
+      // 步骤 3: 点击登录并处理滑块
+      console.log('[3/5] 点击登录...');
+      steps.push('click_login');
+
+      const loginClickResult = await clickLoginButton(page);
+      if (!loginClickResult.clicked) {
+        await saveDebugArtifacts(page, 'login-button-not-found');
+        throw new Error('未找到登录按钮');
+      }
+
+      // 等待一下让滑块可能出现
       await page.waitForTimeout(1500);
-      const retrySlider = await handleSliderVerification(page, 20_000);
-      if (retrySlider.handled && retrySlider.success) {
-        await clickLoginButton(page).catch(() => {});
+
+      // 检测并处理滑块
+      const sliderResult = await handleSliderVerification(page, 30_000);
+      sliderHandled = sliderResult.handled;
+
+      if (sliderResult.handled && !sliderResult.success) {
+        // 滑块拖拽后仍未通过，可能需要重试
+        console.log('[滑块] 第一次拖拽未通过，尝试第二次...');
+
+        // 有些滑块需要等待重置
+        await page.waitForTimeout(1000);
+
+        const retryResult = await handleSliderVerification(page, 20_000);
+        if (retryResult.handled && !retryResult.success) {
+          console.log('[滑块] 重试仍未通过，可能需要手动介入');
+        }
       }
 
-      loginSuccess = await waitForLoginSuccess(page, 20_000);
-    }
-
-    if (!loginSuccess) {
-      // 页内重试也没用，才认为是凭证问题；重试多少次都没意义，直接终止
-      const currentUrl = page.url();
-      if (currentUrl.includes('/auth/login')) {
-        const err = new Error('登录失败：可能账号密码错误或滑块验证未通过');
-        err.retryable = false;
-        err.kind = 'credentials';
-        throw err;
+      // 滑块验证通过后，再次点击登录按钮完成登录
+      if (sliderResult.handled && sliderResult.success) {
+        console.log('[登录] 滑块验证通过，再次点击登录...');
+        const retryLoginClickResult = await clickLoginButton(page);
+        if (!retryLoginClickResult.clicked) {
+          await saveDebugArtifacts(page, debugLabel('login-button-not-found-after-slider'));
+          throw new Error('滑块验证通过后未找到登录按钮');
+        }
+        await page.waitForTimeout(2000);
       }
-    }
 
-    dashboardUrl = page.url();
-    dashboardStats = await loadDashboardStats(page, dashboardUrl);
+      // 等待登录成功
+      loginSuccess = await waitForLoginSuccess(page, 25_000);
+
+      // 登录页是 Vue SPA，滑块通过后的二次点击在 CI 上偶发不跳转。
+      // 这跟账号密码无关，页内重新提交一次通常就过去了；
+      // 直接判成凭证错误会连带取消后面的重试轮次，代价太大。
+      for (let attempt = 1; attempt <= 2 && !loginSuccess; attempt++) {
+        if (!page.url().includes('/auth/login')) break;
+
+        console.log(`[登录] 仍在登录页，重新提交登录 (${attempt}/2)...`);
+        await page.waitForTimeout(2000);
+        await dismissBlockingOverlays(page);
+
+        const reClick = await clickLoginButton(page);
+        if (!reClick.clicked) {
+          console.log('[登录] 重试时未找到登录按钮');
+          break;
+        }
+
+        await page.waitForTimeout(1500);
+        const retrySlider = await handleSliderVerification(page, 20_000);
+        if (retrySlider.handled && retrySlider.success) {
+          await clickLoginButton(page).catch(() => {});
+        }
+
+        loginSuccess = await waitForLoginSuccess(page, 20_000);
+      }
+
+      if (!loginSuccess) {
+        // 页内重试也没用，才认为是凭证问题；重试多少次都没意义，直接终止
+        const currentUrl = page.url();
+        if (currentUrl.includes('/auth/login')) {
+          const err = new Error('登录失败：可能账号密码错误或滑块验证未通过');
+          err.retryable = false;
+          err.kind = 'credentials';
+          throw err;
+        }
+      }
+
+      dashboardUrl = page.url();
+      dashboardStats = await loadDashboardStats(page, dashboardUrl);
+    }
 
     // 步骤 4: 跳转签到页
     console.log('[4/5] 跳转签到页...');
@@ -1555,6 +1766,7 @@ async function attemptCheckInOnce({
           steps,
           loginSuccess,
           sliderHandled,
+          sessionReused,
           signStats: beforeStats,
           dashboardStats,
           template,
@@ -1604,6 +1816,7 @@ async function attemptCheckInOnce({
               steps,
               loginSuccess,
               sliderHandled,
+              sessionReused,
               signStats: afterStats,
               dashboardStats,
               template: retryTemplate,
@@ -1708,6 +1921,7 @@ async function attemptCheckInOnce({
           steps,
           loginSuccess,
           sliderHandled,
+          sessionReused,
           signStats: afterStats,
           dashboardStats: afterDashboardStats,
           template,
@@ -1733,6 +1947,7 @@ async function attemptCheckInOnce({
             steps,
             loginSuccess,
             sliderHandled,
+            sessionReused,
             signStats: afterStats,
             dashboardStats: afterDashboardStats,
             template,
@@ -1750,8 +1965,8 @@ async function attemptCheckInOnce({
     throw new Error('未检测到签到成功或失败提示');
 
   } finally {
+    // persistent context 关闭即等同于关闭浏览器（没有单独的 browser 对象）
     await context.close().catch(() => {});
-    await browser.close().catch(() => {});
     console.log(`[清理] 第 ${round} 轮浏览器已关闭`);
   }
 }
@@ -1850,6 +2065,11 @@ module.exports = {
   attemptCheckInOnce,
   shouldBlockUrl,
   waitForLoginPageRendered,
+  waitForAppView,
+  waitForLoginFormReady,
+  resolveProfileDir,
+  resolveCacheEnabled,
+
   waitForSignPageReady,
   handleSliderVerification,
   clickLoginButton,
