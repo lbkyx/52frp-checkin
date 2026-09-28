@@ -72,15 +72,36 @@ const LOGIN_PAGE_BACKOFF_MS = [0, 6_000, 12_000];
 const LOGIN_GOTO_ATTEMPTS = 2;
 
 /** 登录页：各项等待的上限（ms）。刻意收紧，把时间留给「整轮重来」 */
-const LOGIN_GOTO_TIMEOUT_MS = 30_000;
+// 主 bundle 从境外加载实测 4~12s，30s 在链路抖动时不够用（日志里出现过
+// `page.goto: Timeout 30000ms exceeded`），放宽到 60s。
+const LOGIN_GOTO_TIMEOUT_MS = 60_000;
 const LOGIN_NETWORKIDLE_TIMEOUT_MS = 15_000;
 const LOGIN_RENDER_TIMEOUT_MS = 20_000;
 
 /** 渲染检测的轮询间隔（ms） */
 const LOGIN_RENDER_POLL_MS = 500;
 
-/** 每轮完整流程之间的间隔（ms）：给源站留出恢复时间 */
-const ROUND_BACKOFF_MS = [45_000, 75_000];
+/**
+ * 每轮完整流程之间的间隔（ms）：给源站留出恢复时间。
+ *
+ * 依据 9/28 成功那次的实测：第 1 轮 522 全挂，只隔 45s 的第 2 轮就完整跑通了
+ * —— 说明短窗口（几十秒）也存在，间隔不能一上来就拉到几分钟；
+ * 但同日另一时段连续 3 轮（45s / 75s 间隔）全挂，说明也存在长窗口。
+ * 所以取「短起递增」：早期快速重试捞短窗口，后面拉长覆盖长窗口。
+ */
+const ROUND_BACKOFF_MS = [45_000, 60_000, 90_000, 120_000];
+
+/** 预热用的同源载体页：越小越好，只是为了让 fetch 有同源上下文 */
+const PRELOAD_CARRIER_URL = 'https://www.52frp.com/robots.txt';
+
+/** 预热时抓取的入口 HTML（同源，hash 路由下与登录页是同一份） */
+const PRELOAD_ENTRY_URL = 'https://www.52frp.com/user/';
+
+/** 与签到无关的第一方资源（装饰性图片 / 字体），可屏蔽以减少并发 */
+const MEDIA_ASSET_PATTERNS = [
+  /\.(png|jpe?g|gif|webp|bmp|ico)(\?|$)/i,
+  /\.(woff2?|ttf|eot|otf)(\?|$)/i,
+];
 
 /** 与签到无关、却要跨洋请求的第三方资源 */
 const THIRD_PARTY_HOST_PATTERNS = [
@@ -124,6 +145,18 @@ function resolveBlockThirdPartyMode() {
   return 'safe';
 }
 
+/** 串行预热：默认开启（FRP_PRELOAD=0 关闭） */
+function resolvePreloadEnabled() {
+  const raw = (process.env.FRP_PRELOAD || '1').trim().toLowerCase();
+  return !(raw === '0' || raw === 'off' || raw === 'false' || raw === 'no');
+}
+
+/** 屏蔽第一方装饰性资源（图片 / 字体）：默认关闭，滑块依赖图片时别开 */
+function resolveBlockMediaEnabled() {
+  const raw = (process.env.FRP_BLOCK_MEDIA || '0').trim().toLowerCase();
+  return raw === '1' || raw === 'on' || raw === 'true' || raw === 'yes';
+}
+
 function isUpstreamError(status) {
   return UPSTREAM_ERROR_CODES.includes(Number(status));
 }
@@ -146,11 +179,14 @@ function getUrlPath(rawUrl) {
   }
 }
 
-function shouldBlockUrl(rawUrl, mode) {
+function shouldBlockUrl(rawUrl, mode, { blockMedia = null } = {}) {
   if (mode === 'off') return false;
 
   const host = getUrlHost(rawUrl);
   if (!host) return false; // 解析不了的一律放行，避免误伤
+
+  const mediaOff = blockMedia ?? resolveBlockMediaEnabled();
+  if (mediaOff && MEDIA_ASSET_PATTERNS.some((re) => re.test(rawUrl))) return true;
 
   if (FIRST_PARTY_HOST_PATTERNS.some((re) => re.test(host))) return false;
   if (mode === 'strict') return true; // 严格模式：非 52frp 域名一律拦
@@ -253,6 +289,117 @@ async function installResourceBlocker(page, mode, { badAssets = null } = {}) {
       console.log(`[网络] 本轮重取 ${retried.count} 个失败资源，救回 ${retried.fixed} 个`);
     }
   });
+}
+
+/**
+ * 串行预热：借一个同源的轻量载体页，把入口 HTML 里引用的静态资源**一个一个**
+ * fetch 下来，成功的响应落进持久化 profile 的 HTTP 缓存。
+ *
+ * 为什么必须串行：实测「单发 curl 全部 200，浏览器并发 30+ 请求却大面积 522」，
+ * 说明瓶颈不在单个请求，而在**并发回源**。整页 goto 是浏览器自己并发拉几十个
+ * 资源，我们插不上手；预热则把并发摊平成排队，等真正 goto 时大部分资源已经
+ * 在本地缓存里，跨境请求数从几十降到个位数。
+ *
+ * 失败的那些记在返回值里，交给单资源重试和下一轮去兜。
+ */
+async function preloadAppAssets(page) {
+  const maxAssets = resolveEnvInt('FRP_PRELOAD_MAX', 60);
+  const retryPer = resolveEnvInt('FRP_PRELOAD_RETRY', 2);
+  const budgetMs = resolveEnvInt('FRP_PRELOAD_BUDGET_MS', 240_000);
+
+  try {
+    await page.goto(PRELOAD_CARRIER_URL, { waitUntil: 'domcontentloaded', timeout: 30_000 });
+  } catch {
+    console.log('[预热] 载体页不可达，跳过预热');
+    return { total: 0, ok: 0, failed: [], skipped: true };
+  }
+
+  const startedAt = Date.now();
+
+  const job = page.evaluate(async ({ entryUrl, maxAssets, retryPer }) => {
+    const nap = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+    const ASSET_RE = /assets\/[A-Za-z0-9._-]+\.(?:js|css)/g;
+
+    let html = '';
+    try {
+      const response = await fetch(entryUrl, { credentials: 'include', cache: 'no-store' });
+      if (response.ok) html = await response.text();
+    } catch {
+      // 入口 HTML 都拿不到，这一轮预热没有意义，直接返回
+    }
+
+    // 入口 HTML 里往往只有两三个 script，真正要加载的几十个 chunk 是主 bundle
+    // 运行时动态 import 的 —— 所以拿到的 js 要继续解析它的内容，把里面出现的
+    // chunk 名加进队列，做广度优先抓取。
+    const queue = [...new Set(html.match(ASSET_RE) || [])];
+    const seen = new Set(queue);
+    const failed = [];
+    let ok = 0;
+    let processed = 0;
+
+    while (queue.length > 0 && processed < maxAssets) {
+      const item = queue.shift();
+      processed += 1;
+
+      const url = new URL(item, entryUrl).href;
+      let done = false;
+      let text = null;
+
+      for (let i = 0; i <= retryPer && !done; i++) {
+        if (i > 0) await nap(800 * i);
+        try {
+          const response = await fetch(url, { credentials: 'include' });
+          if (response.ok) {
+            done = true;
+            if (/\.js(\?|$)/.test(url)) text = await response.text().catch(() => null);
+          }
+        } catch {
+          // 网络层失败，继续重试
+        }
+      }
+
+      if (!done) {
+        failed.push(url);
+        continue;
+      }
+
+      ok += 1;
+
+      if (text) {
+        for (const match of text.match(ASSET_RE) || []) {
+          if (seen.has(match)) continue;
+          seen.add(match);
+          queue.push(match);
+        }
+      }
+    }
+
+    return { total: processed, ok, failed: failed.slice(0, 5) };
+  }, { entryUrl: PRELOAD_ENTRY_URL, maxAssets, retryPer });
+
+  const result = await Promise.race([
+    job,
+    new Promise((resolve) => setTimeout(
+      () => resolve({ total: 0, ok: 0, failed: [], timeout: true }),
+      budgetMs,
+    )),
+  ]).catch(() => ({ total: 0, ok: 0, failed: [], error: true }));
+
+  const costSec = Math.round((Date.now() - startedAt) / 1000);
+
+  if (result.timeout || result.error) {
+    console.log(`[预热] ${result.timeout ? '超时' : '异常'}，继续正常流程（已耗时 ${costSec}s）`);
+    return result;
+  }
+
+  if (result.total === 0) {
+    console.log('[预热] 入口 HTML 未取到或没有解析出资源，继续正常流程');
+    return result;
+  }
+
+  console.log(`[预热] 串行预取 ${result.total} 个资源：成功 ${result.ok}，仍失败 ${result.total - result.ok}（耗时 ${costSec}s）`);
+
+  return result;
 }
 
 /**
@@ -610,14 +757,25 @@ async function extractDashboardStats(page) {
 
   const todayRewardMatch = bodyText.match(/本次(?:签到|Check-in)获得\s*([\d.]+\s*(?:TB|GB|MB|KB|B))/i);
   const todayRewardNearLabel = findTrafficNearLabel(lines, [/本次(?:签到|Check-in)获得/i], ['after', 'before'])[0];
+  // 站点文案是「可用Traffic」，不是「剩余流量」——实测仪表盘里只有前者，
+  // 只认「剩余」的话这一项永远是「未取到」。两种写法都留着，换文案也不怕。
   const remainingCandidates = [
-    ...Array.from(bodyText.matchAll(/([\d.]+\s*(?:TB|GB|MB|KB|B))\s*剩余流量/ig)).map((match) => match[1]),
-    ...Array.from(bodyText.matchAll(/剩余流量\s*([\d.]+\s*(?:TB|GB|MB|KB|B))/ig)).map((match) => match[1]),
-    ...findTrafficNearLabel(lines, [/剩余(?:流量|Traffic)/i], ['before', 'after']),
+    ...Array.from(bodyText.matchAll(/([\d.]+\s*(?:TB|GB|MB|KB|B))\s*(?:剩余|可用)(?:流量|Traffic)/ig)).map((match) => match[1]),
+    ...Array.from(bodyText.matchAll(/(?:剩余|可用)(?:流量|Traffic)\s*([\d.]+\s*(?:TB|GB|MB|KB|B))/ig)).map((match) => match[1]),
+    ...findTrafficNearLabel(lines, [/(?:剩余|可用)(?:流量|Traffic)/i], ['before', 'after']),
   ];
 
   const todayRewardText = todayRewardMatch ? todayRewardMatch[1].replace(/\s+/g, '') : todayRewardNearLabel;
-  const remainingBest = pickLargestTrafficText(remainingCandidates);
+
+  // 「数字 + 标签」直接挨在一起的才算显式命中；只有在没有显式命中时，
+  // 才退回到「标签附近找数字」。否则容易把旁边「Check-in 获得」的数字
+  // 当成剩余流量（实测就取到过和累计获得一模一样的值）。
+  const explicitRemaining = [
+    ...Array.from(bodyText.matchAll(/([\d.]+\s*(?:TB|GB|MB|KB|B))\s*(?:剩余|可用)(?:流量|Traffic)/ig)).map((match) => match[1]),
+    ...Array.from(bodyText.matchAll(/(?:剩余|可用)(?:流量|Traffic)\s*[：:]?\s*([\d.]+\s*(?:TB|GB|MB|KB|B))/ig)).map((match) => match[1]),
+  ];
+
+  const remainingBest = pickLargestTrafficText(explicitRemaining.length > 0 ? explicitRemaining : remainingCandidates);
 
   return {
     todayRewardText,
@@ -637,8 +795,8 @@ async function waitForDashboardStats(page, timeoutMs = 15_000) {
       () => {
         const text = (document.body?.innerText || '').replace(/\[MT\]/g, '');
         return (
-          /本次(?:签到|Check-in)获得/i.test(text) &&
-          /剩余(?:流量|Traffic)/i.test(text)
+          /本次(?:签到|Check-in)获得/i.test(text)
+          && /(?:剩余|可用)(?:流量|Traffic)/i.test(text)
         );
       },
       { timeout: timeoutMs }
@@ -668,7 +826,15 @@ async function loadDashboardStats(page, dashboardUrl) {
     return stats;
   }
 
-  console.log('[主页] 仪表盘仍未提取完整，继续使用当前可得数据');
+  // 取不到就如实留「未取到」，但把页面里跟流量相关的行打出来，方便下次定位
+  const hintLines = String(stats.rawText || '')
+    .split('\n')
+    .map((line) => line.trim())
+    .filter((line) => /流量|Traffic|剩余|获得/i.test(line))
+    .slice(0, 5)
+    .join(' / ');
+
+  console.log(`[主页] 仪表盘仍未提取完整，继续使用当前可得数据${hintLines ? `（相关行: ${hintLines.slice(0, 200)}）` : ''}`);
   return stats;
 }
 
@@ -679,11 +845,25 @@ async function loadDashboardStats(page, dashboardUrl) {
  *   success —— 由本次运行完成签到
  *   already —— 脚本点签到之前今日签到就已完成（用户手动签的，或当天更早的一次运行签的）
  */
-function buildResultTemplate(signStats, dashboardStats, kind = 'success') {
+function buildResultTemplate(signStats, dashboardStats, kind = 'success', signRequest = null) {
   const days = Number.isFinite(signStats?.totalSignDays) ? signStats.totalSignDays : '未取到';
-  const todayReward = Number.isFinite(dashboardStats?.todayRewardBytes) && dashboardStats.todayRewardBytes > 0
-    ? formatTrafficCompact(dashboardStats.todayRewardBytes)
-    : '未取到';
+
+  // 本次获得：仪表盘文案经常提取不到（SPA 懒加载 / 文案变了），但签到接口
+  // 每次都会带回 data.traffic（字节数），这是比爬页面可靠得多的来源。
+  const apiTrafficBytes = Number(signRequest?.json?.data?.traffic);
+  const apiBytes = Number.isFinite(apiTrafficBytes) && apiTrafficBytes > 0 ? apiTrafficBytes : null;
+  const dashBytes = Number.isFinite(dashboardStats?.todayRewardBytes) && dashboardStats.todayRewardBytes > 0
+    ? dashboardStats.todayRewardBytes
+    : null;
+
+  const todayReward = dashBytes
+    ? formatTrafficCompact(dashBytes)
+    : (apiBytes ? formatTrafficCompact(apiBytes) : '未取到');
+
+  if (!dashBytes && apiBytes) {
+    console.log(`[结果] 本次获得取自签到接口 data.traffic：${formatTrafficCompact(apiBytes)}`);
+  }
+
   const totalReward = signStats?.totalRewardText ? signStats.totalRewardText.replace(/B$/, '') : '未取到';
   const remaining = dashboardStats?.remainingText ? dashboardStats.remainingText.replace(/B$/, '') : '未取到';
 
@@ -1557,6 +1737,15 @@ async function attemptCheckInOnce({
     try {
       await configureHttpCache(context, page);
 
+      // 串行预热：先逐个把静态资源搬进本地缓存，降低后面 goto 的并发量
+      if (resolvePreloadEnabled()) {
+        try {
+          await preloadAppAssets(page);
+        } catch (preloadErr) {
+          console.log(`[预热] 跳过（${String(preloadErr.message).split('\n')[0]}）`);
+        }
+      }
+
       let sawUpstreamError = false;
 
       for (let attempt = 1; attempt <= maxRetries; attempt++) {
@@ -1884,7 +2073,7 @@ async function attemptCheckInOnce({
         if (retryBeforeCheck.signed && retryBeforeCheck.reliable) {
           console.log(`[签到] 重试时发现已签到: ${retryBeforeCheck.pattern}`);
           afterStats = await extractSignStats(page);
-          const retryTemplate = buildResultTemplate(afterStats, dashboardStats, 'already');
+          const retryTemplate = buildResultTemplate(afterStats, dashboardStats, 'already', signRequest);
           return {
             status: 'already_signed',
             message: retryTemplate,
@@ -1988,7 +2177,7 @@ async function attemptCheckInOnce({
       } else {
         console.log(`[签到] 按「本次运行自动签到成功」上报（判定来源: ${signInfo || '未取到'}）`);
       }
-      const template = buildResultTemplate(afterStats, afterDashboardStats, signKind);
+      const template = buildResultTemplate(afterStats, afterDashboardStats, signKind, signRequest);
 
       return {
         status: 'success',
@@ -2015,7 +2204,7 @@ async function attemptCheckInOnce({
     if (toastCount > 0) {
       const toastText = await toastLocator.innerText().catch(() => '');
       if (toastText.includes('成功')) {
-        const template = buildResultTemplate(afterStats, afterDashboardStats, 'success');
+        const template = buildResultTemplate(afterStats, afterDashboardStats, 'success', signRequest);
         return {
           status: 'success',
           message: template,
@@ -2068,8 +2257,10 @@ async function pureBrowserCheckIn(options = {}) {
     launchOptions = {},
   } = options;
 
-  const maxRounds = resolveEnvInt('FRP_ROUNDS', 3);
-  const totalBudgetMs = resolveEnvInt('FRP_TOTAL_BUDGET_MS', 18 * 60 * 1000);
+  // 522 窗口长短不一（短到 45s、长到几十分钟），所以「多轮 + 短起递增的间隔」
+  // 比「少轮 + 长等待」更划算：5 轮约 15~20 分钟，预算给到 30 分钟。
+  const maxRounds = resolveEnvInt('FRP_ROUNDS', 5);
+  const totalBudgetMs = resolveEnvInt('FRP_TOTAL_BUDGET_MS', 30 * 60 * 1000);
   const startedAt = Date.now();
   let lastError = null;
 
@@ -2145,6 +2336,7 @@ module.exports = {
   waitForLoginFormReady,
   resolveProfileDir,
   resolveCacheEnabled,
+  preloadAppAssets,
 
   waitForSignPageReady,
   handleSliderVerification,
