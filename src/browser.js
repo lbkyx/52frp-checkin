@@ -585,10 +585,12 @@ function formatTrafficCompact(bytes) {
 
   const trim = (value) => value.replace(/\.0+$/, '').replace(/(\.\d*[1-9])0+$/, '$1');
 
-  if (bytes >= 1024 ** 4) return `${trim((bytes / 1024 ** 4).toFixed(2))}T`;
-  if (bytes >= 1024 ** 3) return `${trim((bytes / 1024 ** 3).toFixed(2))}G`;
-  if (bytes >= 1024 ** 2) return `${trim((bytes / 1024 ** 2).toFixed(2))}M`;
-  if (bytes >= 1024) return `${trim((bytes / 1024).toFixed(2))}K`;
+  // 单位必须是 MB / GB 这种完整写法：少了 B 就会显示成「402.31M」，
+  // 而这条分支恰好在仪表盘取不到值、改用接口兜底时才走到（境外环境常见）
+  if (bytes >= 1024 ** 4) return `${trim((bytes / 1024 ** 4).toFixed(2))}TB`;
+  if (bytes >= 1024 ** 3) return `${trim((bytes / 1024 ** 3).toFixed(2))}GB`;
+  if (bytes >= 1024 ** 2) return `${trim((bytes / 1024 ** 2).toFixed(2))}MB`;
+  if (bytes >= 1024) return `${trim((bytes / 1024).toFixed(2))}KB`;
   return `${Math.round(bytes)}B`;
 }
 
@@ -751,9 +753,105 @@ function pickLargestTrafficText(candidates) {
   return normalized[0] || { text: null, bytes: null };
 }
 
+/**
+ * 站点把「签到 / 流量」数据渲染到页面多处，含义各不相同：
+ *   顶部汇总卡「剩余流量」 = 各套餐剩余 + 签到可用
+ *   套餐余量卡「剩余流量」 = 某一个套餐自己的剩余
+ * 这些数字是站点读自己的接口渲染出来的，所以直接读源头最可靠 ——
+ * 不用关心异步组件有没有渲染完，也不受文案改动影响。
+ *
+ * 坑：接口要 `Authorization: Bearer <JWT>`，而 token 只存在于页面运行时的
+ * 内存里（localStorage / sessionStorage 都翻不到），自己发请求一律 401。
+ * 所以这里是**被动捕获页面已经发出的那些响应**，不是我们主动去调接口。
+ */
+const API_STATS_ENDPOINTS = [
+  { path: '/api/user/sign/info', key: 'signInfo' },
+  { path: '/api/user/info', key: 'userInfo' },
+];
+
+function createApiStatsStore() {
+  return { signInfo: null, userInfo: null };
+}
+
+function installApiStatsCapture(page, store) {
+  page.on('response', (response) => {
+    let pathname = '';
+    try {
+      pathname = new URL(response.url()).pathname;
+    } catch {
+      return;
+    }
+
+    const endpoint = API_STATS_ENDPOINTS.find((item) => item.path === pathname);
+    if (!endpoint) return;
+
+    response.json().then((json) => {
+      if (!json || json.status !== 200 || !json.data) return;
+      store[endpoint.key] = json;
+      console.log(`[接口] 已捕获 ${pathname}`);
+    }).catch(() => {});
+  });
+}
+
+/** 把接口 JSON 换算成通报要用的几个值；取不到返回 null，交给上层兜底 */
+function readTrafficFromApi(store) {
+  const sign = store?.signInfo?.data;
+  const user = store?.userInfo?.data;
+
+  return {
+    totalSignDays: Number.isFinite(sign?.total_sign_days) ? sign.total_sign_days : null,
+    totalTrafficBytes: Number.isFinite(sign?.total_traffic) && sign.total_traffic > 0 ? sign.total_traffic : null,
+    // 签到攒下来的、真能拿去穿透用的余额
+    availableBytes: Number.isFinite(sign?.sign_available_traffic)
+      ? sign.sign_available_traffic
+      : (Number.isFinite(user?.traffic?.sign_remaining) ? user.traffic.sign_remaining : null),
+    // 顶部汇总卡：套餐剩余 + 签到可用
+    remainingBytes: Number.isFinite(user?.traffic?.total_remaining) ? user.traffic.total_remaining : null,
+  };
+}
+
+/**
+ * 从 body 文本行里按「数值行 + 标签行相邻」取指标的精确值。
+ *
+ * 站点把统计卡片渲染成「数值」和「标签」两个相邻的文本节点，
+ * 于是 innerText 里就是上下两行：
+ *     1012.28GB
+ *     剩余流量
+ * 而**套餐余量卡**的标签和数值是同一行且顺序相反（「剩余流量1000.00 GB」），
+ * 所以只认「标签独占一行、数值在其上一行」这一种形态，就能天然把两者区分开。
+ *
+ * 这里只依赖文案而不碰 class 名：class 带构建 hash，站点一发布就全变了。
+ */
+function metricByLabel(lines, labels) {
+  for (let index = 1; index < lines.length; index++) {
+    if (!labels.some((re) => re.test(lines[index]))) continue;
+
+    // 数值和单位经常被渲染成上下两行（「1012.28」/「GB」/「剩余流量」），
+    // 所以要把前两行拼起来再看；偶尔也有合并成一行的（「2.28 GB」）。
+    // 用行尾锚定，即使前两行混进了别的内容，取到的也是紧贴标签的那个数。
+    const previous = String(lines[index - 1] || '');
+    const beforePrevious = String(lines[index - 2] || '');
+
+    const match = `${beforePrevious} ${previous}`.match(/([\d.]+)\s*(TB|GB|MB|KB|B)\s*$/i)
+      || previous.match(/([\d.]+)\s*(TB|GB|MB|KB|B)\s*$/i);
+
+    if (match) return normalizeTrafficText(`${match[1]}${match[2].toUpperCase()}`);
+  }
+
+  return null;
+}
+
 async function extractDashboardStats(page) {
   const bodyText = await page.locator('body').innerText().catch(() => '');
   const lines = getBodyLines(bodyText);
+  // 「剩余」和「可用」是两个不同标签，不能混进同一个匹配集：
+  // 混了的话会先命中排在前面的「可用流量」卡片，把总余量取成签到余额
+  const metrics = {
+    剩余流量: metricByLabel(lines, [/^剩余(?:流量|Traffic)$/i]),
+    可用流量: metricByLabel(lines, [/^可用(?:流量|Traffic)$/i]),
+    已用流量: metricByLabel(lines, [/^已用(?:流量|Traffic)$/i]),
+    签到获得: metricByLabel(lines, [/^(?:签到获得|Check-in获得)$/i]),
+  };
 
   const todayRewardMatch = bodyText.match(/本次(?:签到|Check-in)获得\s*([\d.]+\s*(?:TB|GB|MB|KB|B))/i);
   const todayRewardNearLabel = findTrafficNearLabel(lines, [/本次(?:签到|Check-in)获得/i], ['after', 'before'])[0];
@@ -775,13 +873,29 @@ async function extractDashboardStats(page) {
     ...Array.from(bodyText.matchAll(/(?:剩余|可用)(?:流量|Traffic)\s*[：:]?\s*([\d.]+\s*(?:TB|GB|MB|KB|B))/ig)).map((match) => match[1]),
   ];
 
-  const remainingBest = pickLargestTrafficText(explicitRemaining.length > 0 ? explicitRemaining : remainingCandidates);
+  // 优先按「标签 → 数值」的结构化卡片取值。
+  // 页面上有多个「剩余流量」卡片（顶部汇总卡 + 套餐余量卡），靠猜最大值会把
+  // 套餐剩余当成总剩余；更不能反过来只用 explicitRemaining 的第一个命中，
+  // 那个正则分不清汇总卡和套餐卡。
+  const remainingFromMetric = normalizeTrafficText(metrics['剩余流量'] || metrics['可用Traffic'] || '');
+  const remainingBest = remainingFromMetric
+    ? { text: remainingFromMetric, bytes: trafficTextToBytes(remainingFromMetric) }
+    : pickLargestTrafficText(explicitRemaining.length > 0 ? explicitRemaining : remainingCandidates);
+
+  if (remainingFromMetric) {
+    console.log(`[主页] 剩余流量取自顶部汇总卡：${remainingFromMetric}`);
+  }
 
   return {
     todayRewardText,
     todayRewardBytes: trafficTextToBytes(todayRewardText),
     remainingText: remainingBest.text,
     remainingBytes: remainingBest.bytes,
+    // 签到攒下来的、真能拿去穿透用的余额（页面上叫「可用流量」），
+    // 与顶部「剩余流量」是两个不同口径，别再混成一个
+    availableText: normalizeTrafficText(metrics['可用流量'] || metrics['可用Traffic'] || ''),
+    usedText: normalizeTrafficText(metrics['已用流量'] || metrics['已用Traffic'] || ''),
+    metrics,
     remainingCandidates,
     rawText: bodyText,
   };
@@ -845,8 +959,13 @@ async function loadDashboardStats(page, dashboardUrl) {
  *   success —— 由本次运行完成签到
  *   already —— 脚本点签到之前今日签到就已完成（用户手动签的，或当天更早的一次运行签的）
  */
-function buildResultTemplate(signStats, dashboardStats, kind = 'success', signRequest = null) {
-  const days = Number.isFinite(signStats?.totalSignDays) ? signStats.totalSignDays : '未取到';
+function buildResultTemplate(signStats, dashboardStats, kind = 'success', signRequest = null, store = null) {
+  // 数据可靠性排序：站点自己的接口 > 按标签取的页面卡片 > 页面正则
+  const api = readTrafficFromApi(store);
+
+  const days = Number.isFinite(api.totalSignDays)
+    ? api.totalSignDays
+    : (Number.isFinite(signStats?.totalSignDays) ? signStats.totalSignDays : '未取到');
 
   // 本次获得：仪表盘文案经常提取不到（SPA 懒加载 / 文案变了），但签到接口
   // 每次都会带回 data.traffic（字节数），这是比爬页面可靠得多的来源。
@@ -864,8 +983,32 @@ function buildResultTemplate(signStats, dashboardStats, kind = 'success', signRe
     console.log(`[结果] 本次获得取自签到接口 data.traffic：${formatTrafficCompact(apiBytes)}`);
   }
 
-  const totalReward = signStats?.totalRewardText ? signStats.totalRewardText.replace(/B$/, '') : '未取到';
-  const remaining = dashboardStats?.remainingText ? dashboardStats.remainingText.replace(/B$/, '') : '未取到';
+  // 累计获得：接口 > 按标签取的「签到获得」卡片 > 页面正则
+  const rewardFromMetric = normalizeTrafficText(
+    dashboardStats?.metrics?.['签到获得'] || dashboardStats?.metrics?.['Check-in获得'] || ''
+  );
+  const totalReward = Number.isFinite(api.totalTrafficBytes)
+    ? formatTrafficCompact(api.totalTrafficBytes)
+    : (rewardFromMetric || signStats?.totalRewardText || '未取到');
+
+  if (Number.isFinite(api.totalTrafficBytes)) {
+    console.log(`[结果] 累计获得取自签到接口 total_traffic：${totalReward}`);
+  }
+
+  // 两个不同口径，分开报：
+  //   可用流量 = 签到攒下来的余额（真能拿去穿透用的）
+  //   剩余流量 = 站点顶部汇总卡，套餐剩余 + 签到可用
+  const available = Number.isFinite(api.availableBytes)
+    ? formatTrafficCompact(api.availableBytes)
+    : (dashboardStats?.availableText || '未取到');
+
+  const remaining = Number.isFinite(api.remainingBytes)
+    ? formatTrafficCompact(api.remainingBytes)
+    : (dashboardStats?.remainingText || '未取到');
+
+  if (Number.isFinite(api.remainingBytes)) {
+    console.log(`[结果] 剩余流量取自 user/info 的 traffic.total_remaining：${remaining}`);
+  }
 
   const isAlready = kind === 'already';
 
@@ -875,6 +1018,7 @@ function buildResultTemplate(signStats, dashboardStats, kind = 'success', signRe
     `签到天数：${days} 天`,
     `本次获得：${todayReward}`,
     `累计获得：${totalReward}`,
+    `可用流量：${available}`,
     `剩余流量：${remaining}`,
   ];
 
@@ -1679,6 +1823,10 @@ async function attemptCheckInOnce({
   // 砍掉与签到无关的第三方请求，缩小跨境链路上的失败面
   await installResourceBlocker(page, blockMode, { badAssets });
 
+  // 捕获页面自己的统计接口 —— 渲染不全时这是唯一可靠的数据来源
+  const apiStats = createApiStatsStore();
+  installApiStatsCapture(page, apiStats);
+
   // 收集 JS 控制台错误，用于诊断 Vue SPA 渲染失败
   const jsErrors = [];
   page.on('console', (msg) => {
@@ -2021,7 +2169,7 @@ async function attemptCheckInOnce({
     // 检查是否已签到
     const beforeCheck = await checkSignedToday(page);
     if (beforeCheck.signed && beforeCheck.reliable) {
-      const template = buildResultTemplate(beforeStats, dashboardStats, 'already');
+      const template = buildResultTemplate(beforeStats, dashboardStats, 'already', null, apiStats);
       console.log(`[签到] ${beforeCheck.pattern}`);
       console.log('[签到] 今日签到在本轮运行之前就已存在，按「已签到」上报');
       return {
@@ -2073,7 +2221,7 @@ async function attemptCheckInOnce({
         if (retryBeforeCheck.signed && retryBeforeCheck.reliable) {
           console.log(`[签到] 重试时发现已签到: ${retryBeforeCheck.pattern}`);
           afterStats = await extractSignStats(page);
-          const retryTemplate = buildResultTemplate(afterStats, dashboardStats, 'already', signRequest);
+          const retryTemplate = buildResultTemplate(afterStats, dashboardStats, 'already', signRequest, apiStats);
           return {
             status: 'already_signed',
             message: retryTemplate,
@@ -2177,7 +2325,7 @@ async function attemptCheckInOnce({
       } else {
         console.log(`[签到] 按「本次运行自动签到成功」上报（判定来源: ${signInfo || '未取到'}）`);
       }
-      const template = buildResultTemplate(afterStats, afterDashboardStats, signKind, signRequest);
+      const template = buildResultTemplate(afterStats, afterDashboardStats, signKind, signRequest, apiStats);
 
       return {
         status: 'success',
@@ -2204,7 +2352,7 @@ async function attemptCheckInOnce({
     if (toastCount > 0) {
       const toastText = await toastLocator.innerText().catch(() => '');
       if (toastText.includes('成功')) {
-        const template = buildResultTemplate(afterStats, afterDashboardStats, 'success', signRequest);
+        const template = buildResultTemplate(afterStats, afterDashboardStats, 'success', signRequest, apiStats);
         return {
           status: 'success',
           message: template,
@@ -2352,6 +2500,10 @@ module.exports = {
   getUrlPath,
   loadDashboardStats,
   waitForDashboardStats,
+  metricByLabel,
+  createApiStatsStore,
+  installApiStatsCapture,
+  readTrafficFromApi,
   formatTrafficCompact,
   isLoginPageRenderedText,
   trafficTextToBytes,
