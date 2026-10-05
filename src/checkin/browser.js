@@ -47,6 +47,8 @@ function toMetrics(details = {}) {
     totalRewardBytes: signStats.totalRewardBytes ?? null,
     todayRewardBytes: dashboardStats.todayRewardBytes ?? null,
     remainingBytes: dashboardStats.remainingBytes ?? null,
+    // 签到攒下来的余额，与顶部「剩余流量」是两个口径，分开报
+    availableBytes: dashboardStats.availableBytes ?? null,
   };
 }
 

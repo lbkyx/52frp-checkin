@@ -886,19 +886,56 @@ async function extractDashboardStats(page) {
     console.log(`[主页] 剩余流量取自顶部汇总卡：${remainingFromMetric}`);
   }
 
+  // 页面上偶尔会拿到 0：异步统计组件还没把接口数据填进来时，卡片停留在模板初值。
+  // 这跟「真剩 0 字节」长得一模一样，只能靠规则排除 —— 拿 0 当有效值会直接把
+  // 通报里的流量写成 0B，而这个账号显然不可能。
+  const isPlaceholderZero = (bytes) => Number.isFinite(bytes) && bytes === 0;
+  const remainingCoin = isPlaceholderZero(remainingBest.bytes)
+    ? { text: '未取到', bytes: null }
+    : remainingBest;
+
+  const availableText = normalizeTrafficText(metrics['可用流量'] || metrics['可用Traffic'] || '');
+  const availableBytes = trafficTextToBytes(availableText);
+
   return {
     todayRewardText,
     todayRewardBytes: trafficTextToBytes(todayRewardText),
-    remainingText: remainingBest.text,
-    remainingBytes: remainingBest.bytes,
+    remainingText: remainingCoin.text,
+    remainingBytes: remainingCoin.bytes,
     // 签到攒下来的、真能拿去穿透用的余额（页面上叫「可用流量」），
     // 与顶部「剩余流量」是两个不同口径，别再混成一个
-    availableText: normalizeTrafficText(metrics['可用流量'] || metrics['可用Traffic'] || ''),
+    availableText: isPlaceholderZero(availableBytes) ? '' : availableText,
+    availableBytes: isPlaceholderZero(availableBytes) ? null : availableBytes,
     usedText: normalizeTrafficText(metrics['已用流量'] || metrics['已用Traffic'] || ''),
     metrics,
     remainingCandidates,
     rawText: bodyText,
   };
+}
+
+/**
+ * 用站点自己的接口 JSON 修正/补全页面提取到的数值。
+ *
+ * 为什么必须有这一步：境外链路上页面经常渲染不全，统计卡片会停在站点模板的
+ * 初始值 0（«剩余流量 0B»）。这个 0 长得跟真值一样，靠页面文案分辨不出来，
+ * 但它是错的 —— 而 /api/user/info、/api/user/sign/info 是页面必发的请求，
+ * 只要有响应就有权威数据，不依赖任何异步组件渲染完成。
+ *
+ * 只覆盖接口里确实拿到了的字段，拿不到的保持原样，不清空已有值。
+ */
+function applyApiTraffic(dashboardStats, store) {
+  if (!dashboardStats || !store) return dashboardStats;
+
+  const api = readTrafficFromApi(store);
+
+  for (const [key, value] of [['remainingBytes', api.remainingBytes], ['availableBytes', api.availableBytes]]) {
+    if (!Number.isFinite(value)) continue;
+    const had = dashboardStats[key];
+    dashboardStats[key] = value;
+    if (had !== value) console.log(`[主页] ${key}：页面 ${had ?? '未取到'} → 接口 ${value}`);
+  }
+
+  return dashboardStats;
 }
 
 async function waitForDashboardStats(page, timeoutMs = 15_000) {
@@ -920,9 +957,10 @@ async function waitForDashboardStats(page, timeoutMs = 15_000) {
   await page.waitForTimeout(1200);
 }
 
-async function loadDashboardStats(page, dashboardUrl) {
+async function loadDashboardStats(page, dashboardUrl, store = null) {
   await waitForDashboardStats(page);
   let stats = await extractDashboardStats(page);
+  stats = applyApiTraffic(stats, store);
 
   if (stats.todayRewardBytes && stats.remainingBytes) {
     return stats;
@@ -933,7 +971,7 @@ async function loadDashboardStats(page, dashboardUrl) {
   if (dashboardUrl) {
     await page.goto(dashboardUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
     await waitForDashboardStats(page);
-    stats = await extractDashboardStats(page);
+    stats = applyApiTraffic(await extractDashboardStats(page), store);
   }
 
   if (stats.todayRewardBytes && stats.remainingBytes) {
@@ -2017,7 +2055,7 @@ async function attemptCheckInOnce({
       dashboardUrl = DASHBOARD_PAGE;
       console.log('[2/5] 复用上次登录态（cookie 有效），跳过账号密码与滑块');
       steps.push('session_reused');
-      dashboardStats = await loadDashboardStats(page, dashboardUrl);
+      dashboardStats = await loadDashboardStats(page, dashboardUrl, apiStats);
     } else {
       // 登录态失效：清掉残留 cookie，用账号密码重新登录（新 cookie 会随 profile 落盘）
       console.log('[2/5] 登录态失效，改用账号密码登录...');
@@ -2149,7 +2187,7 @@ async function attemptCheckInOnce({
       }
 
       dashboardUrl = page.url();
-      dashboardStats = await loadDashboardStats(page, dashboardUrl);
+      dashboardStats = await loadDashboardStats(page, dashboardUrl, apiStats);
     }
 
     // 步骤 4: 跳转签到页
@@ -2310,7 +2348,7 @@ async function attemptCheckInOnce({
     let afterDashboardStats = dashboardStats;
     if (dashboardUrl) {
       await page.goto(dashboardUrl, { waitUntil: 'domcontentloaded' }).catch(() => {});
-      afterDashboardStats = await loadDashboardStats(page, dashboardUrl);
+      afterDashboardStats = await loadDashboardStats(page, dashboardUrl, apiStats);
     }
 
     if (afterCheck.signed || requestCheck.signed) {

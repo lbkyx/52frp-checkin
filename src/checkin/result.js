@@ -47,6 +47,8 @@ function normalizeMetrics(metrics) {
     totalSignDays: toNumberOrNull(metrics.totalSignDays),
     todayRewardBytes: toNumberOrNull(metrics.todayRewardBytes),
     totalRewardBytes: toNumberOrNull(metrics.totalRewardBytes),
+    // 两个口径：availableBytes 是签到攒下来的余额，remainingBytes 是含套餐的总余量
+    availableBytes: toNumberOrNull(metrics.availableBytes),
     remainingBytes: toNumberOrNull(metrics.remainingBytes),
   };
 
@@ -90,12 +92,20 @@ function formatTrafficCompact(bytes) {
 
 function metricsLines(metrics) {
   if (!metrics) return [];
-  return [
+  const lines = [
     `签到天数：${metrics.totalSignDays ?? MISSING_TEXT} 天`,
     `本次获得：${formatTrafficCompact(metrics.todayRewardBytes)}`,
     `累计获得：${formatTrafficCompact(metrics.totalRewardBytes)}`,
-    `剩余流量：${formatTrafficCompact(metrics.remainingBytes)}`,
   ];
+
+  // 「可用流量」是签到攒下来的余额，「剩余流量」是含套餐的总余量，
+  // 两者在页面上相差两个数量级，合成一个数必然报错
+  if (metrics.availableBytes !== null && metrics.availableBytes !== undefined) {
+    lines.push(`可用流量：${formatTrafficCompact(metrics.availableBytes)}`);
+  }
+  lines.push(`剩余流量：${formatTrafficCompact(metrics.remainingBytes)}`);
+
+  return lines;
 }
 
 /**

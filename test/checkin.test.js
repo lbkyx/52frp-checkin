@@ -194,7 +194,11 @@ test('默认策略注册表只剩 browser', () => {
 test('浏览器结果映射成统一结构', () => {
   const metrics = toMetrics({
     signStats: { totalSignDays: 16, totalRewardBytes: 3 * 1024 ** 3 },
-    dashboardStats: { todayRewardBytes: 250 * 1024 ** 2, remainingBytes: 11 * 1024 ** 3 },
+    dashboardStats: {
+      todayRewardBytes: 250 * 1024 ** 2,
+      remainingBytes: 11 * 1024 ** 3,
+      availableBytes: 2 * 1024 ** 3,
+    },
   });
 
   assert.deepStrictEqual(metrics, {
@@ -202,7 +206,21 @@ test('浏览器结果映射成统一结构', () => {
     totalRewardBytes: 3 * 1024 ** 3,
     todayRewardBytes: 250 * 1024 ** 2,
     remainingBytes: 11 * 1024 ** 3,
+    availableBytes: 2 * 1024 ** 3,
   });
+});
+
+test('页面初值 0 不应被当成有效流量通报出去', () => {
+  // 渲染不全时卡片停在模板初值 0，与「真的剩 0 字节」长得一样
+  const notice = buildNotice(
+    createResult({
+      status: STATUS.ALREADY,
+      strategy: 'browser',
+      metrics: { totalSignDays: 26, remainingBytes: 0, availableBytes: 0 },
+    })
+  );
+  // 这里只能如实显示，真正的过滤发生在 extractDashboardStats（拿不到就是「未取到」）
+  assert.match(notice, /剩余流量：0B/);
 });
 
 test('浏览器失败原因分类', () => {
