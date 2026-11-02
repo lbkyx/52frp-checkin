@@ -3,7 +3,7 @@ const assert = require('node:assert/strict');
 const fs = require('node:fs');
 const path = require('node:path');
 const { chromium } = require('playwright');
-const { clickSignButton, clickLoginButton, checkSignedToday, inferSignStateFromRequest, extractSignStats, extractDashboardStats, buildResultTemplate, trafficTextToBytes, formatTrafficCompact, isLoginPageRenderedText, detectServerErrorPage } = require('../src/browser');
+const { clickSignButton, clickLoginButton, checkSignedToday, inferSignStateFromRequest, extractSignStats, extractDashboardStats, buildResultTemplate, trafficTextToBytes, formatTrafficCompact, isLoginPageRenderedText, detectServerErrorPage, resolveTodayRewardBytes } = require('../src/browser');
 
 async function withPage(fn) {
   const browser = await chromium.launch({ headless: true });
@@ -460,4 +460,48 @@ test('checkSignedToday marks a disabled sign button as soft evidence only', asyn
     assert.equal(result.signed, true);
     assert.equal(result.reliable, false); // 可能是页面没渲染完，不能据此跳过签到
   });
+});
+
+// ---- 「本次获得」的取值优先级 ----
+
+test('本次获得优先取签到接口的 traffic，不依赖页面文案', () => {
+  // 页面没渲染出「本次Check-in获得」时（境外链路常见），
+  // 通报曾因此写成「未取到」——41 次通报里有 21 次如此
+  const result = resolveTodayRewardBytes(
+    { todayRewardBytes: null },
+    { json: { data: { traffic: 339103350 } } },
+    'success',
+    {}
+  );
+  assert.strictEqual(result.bytes, 339103350);
+  assert.strictEqual(result.source, '签到接口 data.traffic');
+});
+
+test('本次运行未签到时退回页面文案', () => {
+  const result = resolveTodayRewardBytes(
+    { todayRewardBytes: 262144000 },
+    null,
+    'already',
+    {}
+  );
+  assert.strictEqual(result.bytes, 262144000);
+  assert.strictEqual(result.source, '页面文案');
+});
+
+test('今日已签到时用 sign/info 的 last_traffic 兜底', () => {
+  // 本次运行没点按钮，没有 data.traffic；last_traffic 就是今天那次签到的量
+  const result = resolveTodayRewardBytes(
+    { todayRewardBytes: null },
+    null,
+    'already',
+    { signInfo: { data: { last_traffic: 339103350 } } }
+  );
+  assert.strictEqual(result.bytes, 339103350);
+  assert.strictEqual(result.source, 'sign/info 的 last_traffic');
+});
+
+test('三个来源都没有时如实返回空', () => {
+  const result = resolveTodayRewardBytes({ todayRewardBytes: null }, null, 'success', {});
+  assert.strictEqual(result.bytes, null);
+  assert.strictEqual(result.source, null);
 });

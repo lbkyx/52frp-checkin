@@ -938,6 +938,62 @@ function applyApiTraffic(dashboardStats, store) {
   return dashboardStats;
 }
 
+/**
+ * 定「本次获得」的字节数。
+ *
+ * 之前这个值只有**页面文案**一个来源，于是境外链路上渲染不全时整份通报就写成
+ * 「本次获得：未取到」——实测 41 次通报里有 21 次如此。
+ * 三个来源按可靠度排：
+ *
+ *   1. 签到接口响应的 data.traffic —— 本次运行真签到时的权威值，必然等于当次获得
+ *   2. 页面「本次Check-in获得」文案  —— 签到后渲染出来时可用
+ *   3. sign/info 的 last_traffic      —— 最近一次签到获得的量，
+ *      用于「今日已签到」场景（本次没点按钮，没有 data.traffic）
+ *
+ * 注意第 3 条在「今日已签到」场景是**今天早些时候那次**签到的量，
+ * 正好就是用户想知道的那一份，不是隔天的旧值。
+ */
+function resolveTodayRewardBytes(dashboardStats, signRequest, signKind, store) {
+  const signTraffic = Number(signRequest?.json?.data?.traffic);
+  if (signKind !== 'already' && Number.isFinite(signTraffic) && signTraffic > 0) {
+    return { bytes: signTraffic, source: '签到接口 data.traffic' };
+  }
+
+  const pageBytes = Number(dashboardStats?.todayRewardBytes);
+  if (Number.isFinite(pageBytes) && pageBytes > 0) {
+    return { bytes: pageBytes, source: '页面文案' };
+  }
+
+  const lastTraffic = Number(store?.signInfo?.data?.last_traffic);
+  if (Number.isFinite(lastTraffic) && lastTraffic > 0) {
+    return { bytes: lastTraffic, source: 'sign/info 的 last_traffic' };
+  }
+
+  return { bytes: null, source: null };
+}
+
+/**
+ * 把「本次获得」写回仪表盘统计里。
+ *
+ * 通报由 src/checkin/result.js 的 buildNotice 组装，它只认 metrics，
+ * 而 metrics 的 todayRewardBytes 来自 dashboardStats —— 所以值必须落到这里，
+ * 光在别处算出来是进不了通报的。
+ */
+function applyTodayReward(dashboardStats, signRequest, signKind, store) {
+  if (!dashboardStats) return dashboardStats;
+
+  const { bytes, source } = resolveTodayRewardBytes(dashboardStats, signRequest, signKind, store);
+  if (!bytes) return dashboardStats;
+
+  const had = dashboardStats.todayRewardBytes;
+  dashboardStats.todayRewardBytes = bytes;
+  if (had !== bytes) {
+    console.log(`[结果] 本次获得取自${source}：${formatTrafficCompact(bytes)}`);
+  }
+
+  return dashboardStats;
+}
+
 async function waitForDashboardStats(page, timeoutMs = 15_000) {
   await page.waitForLoadState('networkidle', { timeout: Math.min(timeoutMs, 10_000) }).catch(() => {});
 
@@ -1017,9 +1073,6 @@ function buildResultTemplate(signStats, dashboardStats, kind = 'success', signRe
     ? formatTrafficCompact(dashBytes)
     : (apiBytes ? formatTrafficCompact(apiBytes) : '未取到');
 
-  if (!dashBytes && apiBytes) {
-    console.log(`[结果] 本次获得取自签到接口 data.traffic：${formatTrafficCompact(apiBytes)}`);
-  }
 
   // 累计获得：接口 > 按标签取的「签到获得」卡片 > 页面正则
   const rewardFromMetric = normalizeTrafficText(
@@ -2207,6 +2260,7 @@ async function attemptCheckInOnce({
     // 检查是否已签到
     const beforeCheck = await checkSignedToday(page);
     if (beforeCheck.signed && beforeCheck.reliable) {
+      applyTodayReward(dashboardStats, null, 'already', apiStats);
       const template = buildResultTemplate(beforeStats, dashboardStats, 'already', null, apiStats);
       console.log(`[签到] ${beforeCheck.pattern}`);
       console.log('[签到] 今日签到在本轮运行之前就已存在，按「已签到」上报');
@@ -2363,6 +2417,7 @@ async function attemptCheckInOnce({
       } else {
         console.log(`[签到] 按「本次运行自动签到成功」上报（判定来源: ${signInfo || '未取到'}）`);
       }
+      applyTodayReward(afterDashboardStats, signRequest, signKind, apiStats);
       const template = buildResultTemplate(afterStats, afterDashboardStats, signKind, signRequest, apiStats);
 
       return {
@@ -2390,6 +2445,7 @@ async function attemptCheckInOnce({
     if (toastCount > 0) {
       const toastText = await toastLocator.innerText().catch(() => '');
       if (toastText.includes('成功')) {
+        applyTodayReward(afterDashboardStats, signRequest, 'success', apiStats);
         const template = buildResultTemplate(afterStats, afterDashboardStats, 'success', signRequest, apiStats);
         return {
           status: 'success',
@@ -2542,6 +2598,8 @@ module.exports = {
   createApiStatsStore,
   installApiStatsCapture,
   readTrafficFromApi,
+  resolveTodayRewardBytes,
+  applyTodayReward,
   formatTrafficCompact,
   isLoginPageRenderedText,
   trafficTextToBytes,
