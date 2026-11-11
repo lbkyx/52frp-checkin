@@ -50,7 +50,7 @@ cron 和手动执行撞到一起时会自动跳过，不会开两个浏览器抢
 | 企业微信群机器人 | `WECOM_BOT_WEBHOOK` |
 | 钉钉机器人 | `DINGTALK_WEBHOOK`（开了加签再加 `DINGTALK_SECRET`） |
 | 飞书机器人 | `FEISHU_WEBHOOK`（开了加签再加 `FEISHU_SECRET`） |
-| PushPlus（可转微信） | `PUSHPLUS_TOKEN`（+ 可选 `PUSHPLUS_CHANNEL`） |
+| PushPlus（可转微信） | `PUSHPLUS_TOKEN`（+ 可选 `PUSHPLUS_TOPIC` 群组编码、`PUSHPLUS_CHANNEL` 渠道） |
 | Server酱 | `SERVERCHAN_KEY` |
 | PushDeer | `SENDKEY` |
 | Bark（iOS） | `BARK_KEY` |

@@ -22,6 +22,7 @@ const {
 const PUSH_ENV_NAMES = [
   ...new Set(PUSH_CHANNELS.flatMap((channel) => channel.env)),
   'PUSHPLUS_CHANNEL',
+  'PUSHPLUS_TOPIC',
   'DINGTALK_SECRET',
   'FEISHU_SECRET',
   'YUNHU_RECV_TYPE',
@@ -294,7 +295,7 @@ test('pushRequest: 设置了请求超时（AbortSignal.timeout）', async () => 
 
 // ---- 各渠道请求体 ----
 
-test('PushPlus: 请求体带 token/title/content，配置了 channel 才带 channel', async () => {
+test('PushPlus: 请求体带 token/title/content，配置了 topic/channel 才带上对应字段', async () => {
   const fetchMock = mockFetch(() => ({ code: 200 }));
   const restore = silenceLogs();
   try {
@@ -304,12 +305,15 @@ test('PushPlus: 请求体带 token/title/content，配置了 channel 才带 chan
       assert.equal(body.token, 'pk');
       assert.equal(body.title, '标题');
       assert.equal(body.content, '正文');
+      assert.equal(body.topic, undefined);
       assert.equal(body.channel, undefined);
     });
-    await withEnv({ PUSHPLUS_TOKEN: 'pk', PUSHPLUS_CHANNEL: 'wechat', PUSH_RETRY_MIN_WAIT_MS: '1' }, async () => {
+    await withEnv({ PUSHPLUS_TOKEN: 'pk', PUSHPLUS_TOPIC: 'ql', PUSHPLUS_CHANNEL: 'wechat', PUSH_RETRY_MIN_WAIT_MS: '1' }, async () => {
       fetchMock.calls.length = 0;
       await pushPlus('标题', '正文');
-      assert.equal(JSON.parse(fetchMock.calls[0].init.body).channel, 'wechat');
+      const body = JSON.parse(fetchMock.calls[0].init.body);
+      assert.equal(body.topic, 'ql');
+      assert.equal(body.channel, 'wechat');
     });
   } finally {
     fetchMock.restore();

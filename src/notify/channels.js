@@ -92,6 +92,10 @@ async function pushPlus(title, content) {
     template: 'html',
   };
 
+  // PUSHPLUS_TOPIC 是一对多群组的群组编码；不填则发给 token 所属的个人
+  const topic = readEnv('PUSHPLUS_TOPIC');
+  if (topic) payload.topic = topic;
+
   // PUSHPLUS_CHANNEL 是老配置，继续沿用：不填就按 PushPlus 后台的默认渠道发
   const channel = readEnv('PUSHPLUS_CHANNEL');
   if (channel) payload.channel = channel;

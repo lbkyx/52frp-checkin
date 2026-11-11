@@ -1,5 +1,5 @@
 #!/bin/bash
-# 52frp 每日签到入口 —— 供 cron / 宝塔计划任务调用。
+# 52frp 每日签到入口 —— 供 cron / 1Panel（或宝塔）计划任务调用。
 #
 # 做的事情与 GitHub Actions 里的 workflow 一致：
 #   1. 跑 checkin-v2.js（浏览器自动化签到）
@@ -10,7 +10,7 @@
 #
 # 凭据放在脚本同目录的 .env（参考 .env.example），权限建议 600：
 #   FRP_USERNAME / FRP_PASSWORD   必填
-#   TG_BOT_TOKEN / TG_CHAT_ID      Telegram 推送（其他渠道见 .env.example）
+#   PUSHPLUS_TOKEN 等             推送配置（渠道见 .env.example）
 #
 # 输出是实时的（边跑边往 stdout 写），所以在宝塔「计划任务 → 日志」里
 # 执行过程中就能看到进度；一次完整签到约 2～3 分钟。
